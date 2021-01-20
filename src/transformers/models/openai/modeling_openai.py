@@ -412,6 +412,7 @@ class OpenAIGPTModel(OpenAIGPTPreTrainedModel):
 
         self.register_buffer("position_ids", torch.arange(config.n_positions))
         self.init_weights()
+        self.no_grad_layers = 0
 
     def get_input_embeddings(self):
         return self.tokens_embed
@@ -444,7 +445,11 @@ class OpenAIGPTModel(OpenAIGPTPreTrainedModel):
         output_attentions=None,
         output_hidden_states=None,
         return_dict=None,
+        checkpoint_grads=False
     ):
+        grad_enabled_ = torch.is_grad_enabled()
+        if self.no_grad_layers > 0:
+            torch.set_grad_enabled(False)
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -501,13 +506,31 @@ class OpenAIGPTModel(OpenAIGPTPreTrainedModel):
         all_attentions = () if output_attentions else None
         all_hidden_states = () if output_hidden_states else None
         for i, block in enumerate(self.h):
+            grad_enabled = i >= self.no_grad_layers
+            torch.set_grad_enabled(grad_enabled)
+            if i == self.no_grad_layers and self.no_grad_layers > 0:
+                hidden_states.requires_grad = True
             if output_hidden_states:
                 all_hidden_states = all_hidden_states + (hidden_states,)
 
-            outputs = block(hidden_states, attention_mask, head_mask[i], output_attentions=output_attentions)
+            if checkpoint_grads and grad_enabled:
+                # Adapted from https://github.com/huggingface/transformers/issues/6564
+                def create_custom_forward(module):
+                    return lambda *args: tuple(module(*args, output_attentions=output_attentions))
+
+                outputs = torch.utils.checkpoint.checkpoint(
+                    create_custom_forward(block),
+                    hidden_states,
+                    attention_mask,
+                    head_mask[i]
+                )
+            else:
+                outputs = block(hidden_states, attention_mask, head_mask[i], output_attentions=output_attentions)
+            #print(i, grad_enabled, outputs[0].grad_fn)
             hidden_states = outputs[0]
             if output_attentions:
                 all_attentions = all_attentions + (outputs[1],)
+        torch.set_grad_enabled(grad_enabled_)
 
         hidden_states = hidden_states.view(*output_shape)
         # Add last layer
@@ -545,6 +568,19 @@ class OpenAIGPTLMHeadModel(OpenAIGPTPreTrainedModel):
     def set_output_embeddings(self, new_embeddings):
         self.lm_head = new_embeddings
 
+    def set_no_grad_layers(self, nlayers):
+        print(f'Setting no_grad_layers {nlayers}')
+        #for m in self.transformer.h[:nlayers]:
+        #    for p in m.parameters():
+        #        p.requires_grad = False
+        self.transformer.no_grad_layers = nlayers
+        
+    def remove_layers(self, n):
+        print(f'Pruning {n} layers off of model.')
+        print(f'Initial model has {len(self.transformer.h)} layers.')
+        self.transformer.h = self.transformer.h[:len(self.transformer.h)-n]
+        print(f'Final model has {len(self.transformer.h)} layers.')
+
     @add_start_docstrings_to_model_forward(OPENAI_GPT_INPUTS_DOCSTRING)
     @add_code_sample_docstrings(
         tokenizer_class=_TOKENIZER_FOR_DOC,
@@ -564,6 +600,7 @@ class OpenAIGPTLMHeadModel(OpenAIGPTPreTrainedModel):
         output_attentions=None,
         output_hidden_states=None,
         return_dict=None,
+        checkpoint_grads=False,
     ):
         r"""
         labels (:obj:`torch.LongTensor` of shape :obj:`(batch_size, sequence_length)`, `optional`):
@@ -583,6 +620,7 @@ class OpenAIGPTLMHeadModel(OpenAIGPTPreTrainedModel):
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
+            checkpoint_grads=checkpoint_grads,
         )
         hidden_states = transformer_outputs[0]
         lm_logits = self.lm_head(hidden_states)
