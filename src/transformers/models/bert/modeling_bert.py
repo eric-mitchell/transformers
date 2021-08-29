@@ -548,7 +548,10 @@ class BertEncoder(nn.Module):
         all_cross_attentions = () if output_attentions and self.config.add_cross_attention else None
 
         next_decoder_cache = () if use_cache else None
+        grad_was_enabled = torch.is_grad_enabled()
+        no_grad_layers = self.no_grad_layers if hasattr(self, "no_grad_layers") else 0
         for i, layer_module in enumerate(self.layer):
+            torch.set_grad_enabled(i >= no_grad_layers)
             if output_hidden_states:
                 all_hidden_states = all_hidden_states + (hidden_states,)
 
@@ -597,6 +600,7 @@ class BertEncoder(nn.Module):
                 if self.config.add_cross_attention:
                     all_cross_attentions = all_cross_attentions + (layer_outputs[2],)
 
+        torch.set_grad_enabled(grad_was_enabled)
         if output_hidden_states:
             all_hidden_states = all_hidden_states + (hidden_states,)
 

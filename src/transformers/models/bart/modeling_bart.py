@@ -774,7 +774,12 @@ class BartEncoder(BartPretrainedModel):
             assert head_mask.size()[0] == (
                 len(self.layers)
             ), f"The head_mask should be specified for {len(self.layers)} layers, but it is for {head_mask.size()[0]}."
+
+        grad_was_enabled = torch.is_grad_enabled()
+        no_grad_layers = self.no_grad_layers if hasattr(self, "no_grad_layers") else 0
         for idx, encoder_layer in enumerate(self.layers):
+            torch.set_grad_enabled(idx >= no_grad_layers)
+
             if output_hidden_states:
                 encoder_states = encoder_states + (hidden_states,)
             # add LayerDrop (see https://arxiv.org/abs/1909.11556 for description)
@@ -809,6 +814,7 @@ class BartEncoder(BartPretrainedModel):
             if output_attentions:
                 all_attentions = all_attentions + (layer_outputs[1],)
 
+        torch.set_grad_enabled(grad_was_enabled)
         if output_hidden_states:
             encoder_states = encoder_states + (hidden_states,)
 
@@ -1010,7 +1016,11 @@ class BartDecoder(BartPretrainedModel):
                 assert attn_mask.size()[0] == (
                     len(self.layers)
                 ), f"The `{mask_name}` should be specified for {len(self.layers)} layers, but it is for {head_mask.size()[0]}."
+
+        grad_was_enabled = torch.is_grad_enabled()
+        no_grad_layers = self.no_grad_layers if hasattr(self, "no_grad_layers") else 0
         for idx, decoder_layer in enumerate(self.layers):
+            torch.set_grad_enabled(idx >= no_grad_layers)
             # add LayerDrop (see https://arxiv.org/abs/1909.11556 for description)
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
@@ -1072,6 +1082,7 @@ class BartDecoder(BartPretrainedModel):
                 if encoder_hidden_states is not None:
                     all_cross_attentions += (layer_outputs[2],)
 
+        torch.set_grad_enabled(grad_was_enabled)
         # add hidden states from the last decoder layer
         if output_hidden_states:
             all_hidden_states += (hidden_states,)

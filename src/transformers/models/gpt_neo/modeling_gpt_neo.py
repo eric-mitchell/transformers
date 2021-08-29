@@ -824,7 +824,10 @@ class GPTNeoModel(GPTNeoPreTrainedModel):
         presents = () if use_cache else None
         all_self_attentions = () if output_attentions else None
         all_hidden_states = () if output_hidden_states else None
+        grad_was_enabled = torch.is_grad_enabled()
+        no_grad_layers = self.no_grad_layers if hasattr(self, "no_grad_layers") else 0
         for i, (block, layer_past) in enumerate(zip(self.h, past_key_values)):
+            torch.set_grad_enabled(idx >= no_grad_layers)
             attn_type = self.config.attention_layers[i]
             attn_mask = global_attention_mask if attn_type == "global" else local_attention_mask
 
@@ -871,6 +874,7 @@ class GPTNeoModel(GPTNeoPreTrainedModel):
             if output_attentions:
                 all_self_attentions = all_self_attentions + (outputs[2 if use_cache else 1],)
 
+        torch.set_grad_enabled(grad_was_enabled)
         hidden_states = self.ln_f(hidden_states)
 
         hidden_states = hidden_states.view(*output_shape)
