@@ -16,11 +16,29 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from ...file_utils import is_sentencepiece_available, is_tokenizers_available
+from typing import TYPE_CHECKING
 
+from ...file_utils import _LazyModule, is_sentencepiece_available, is_tokenizers_available
+
+
+_import_structure = {}
 
 if is_sentencepiece_available():
-    from .tokenization_barthez import BarthezTokenizer
+    _import_structure["tokenization_barthez"] = ["BarthezTokenizer"]
 
 if is_tokenizers_available():
-    from .tokenization_barthez_fast import BarthezTokenizerFast
+    _import_structure["tokenization_barthez_fast"] = ["BarthezTokenizerFast"]
+
+
+if TYPE_CHECKING:
+
+    if is_sentencepiece_available():
+        from .tokenization_barthez import BarthezTokenizer
+
+    if is_tokenizers_available():
+        from .tokenization_barthez_fast import BarthezTokenizerFast
+
+else:
+    import sys
+
+    sys.modules[__name__] = _LazyModule(__name__, globals()["__file__"], _import_structure)

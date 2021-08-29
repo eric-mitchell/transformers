@@ -13,7 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-
 import copy
 import unittest
 
@@ -29,9 +28,11 @@ from transformers import (
     MODEL_FOR_SEQUENCE_CLASSIFICATION_MAPPING,
     MODEL_FOR_TABLE_QUESTION_ANSWERING_MAPPING,
     MODEL_FOR_TOKEN_CLASSIFICATION_MAPPING,
+    TapasConfig,
     is_torch_available,
 )
 from transformers.file_utils import cached_property
+from transformers.models.auto import get_values
 from transformers.testing_utils import require_scatter, require_torch, slow, torch_device
 
 from .test_configuration_common import ConfigTester
@@ -42,7 +43,6 @@ if is_torch_available():
     import torch
 
     from transformers import (
-        TapasConfig,
         TapasForMaskedLM,
         TapasForQuestionAnswering,
         TapasForSequenceClassification,
@@ -62,7 +62,7 @@ if is_torch_available():
 
 
 class TapasModelTester:
-    """You can also import this e.g from .test_modeling_tapas import TapasModelTester """
+    """You can also import this e.g from .test_modeling_tapas import TapasModelTester"""
 
     def __init__(
         self,
@@ -105,7 +105,7 @@ class TapasModelTester:
         average_logits_per_cell=True,
         select_one_column=True,
         allow_empty_column_selection=False,
-        init_cell_selection_weights_to_zero=False,
+        init_cell_selection_weights_to_zero=True,
         reset_position_index_per_cell=True,
         disable_per_token_loss=False,
         scope=None,
@@ -182,7 +182,24 @@ class TapasModelTester:
             float_answer = floats_tensor([self.batch_size]).to(torch_device)
             aggregation_labels = ids_tensor([self.batch_size], self.num_aggregation_labels).to(torch_device)
 
-        config = TapasConfig(
+        config = self.get_config()
+
+        return (
+            config,
+            input_ids,
+            input_mask,
+            token_type_ids,
+            sequence_labels,
+            token_labels,
+            labels,
+            numeric_values,
+            numeric_values_scale,
+            float_answer,
+            aggregation_labels,
+        )
+
+    def get_config(self):
+        return TapasConfig(
             vocab_size=self.vocab_size,
             hidden_size=self.hidden_size,
             num_hidden_layers=self.num_hidden_layers,
@@ -217,20 +234,6 @@ class TapasModelTester:
             init_cell_selection_weights_to_zero=self.init_cell_selection_weights_to_zero,
             reset_position_index_per_cell=self.reset_position_index_per_cell,
             disable_per_token_loss=self.disable_per_token_loss,
-        )
-
-        return (
-            config,
-            input_ids,
-            input_mask,
-            token_type_ids,
-            sequence_labels,
-            token_labels,
-            labels,
-            numeric_values,
-            numeric_values_scale,
-            float_answer,
-            aggregation_labels,
         )
 
     def create_and_check_model(
@@ -425,7 +428,7 @@ class TapasModelTest(ModelTesterMixin, unittest.TestCase):
 
     def _prepare_for_class(self, inputs_dict, model_class, return_labels=False):
         inputs_dict = copy.deepcopy(inputs_dict)
-        if model_class in MODEL_FOR_MULTIPLE_CHOICE_MAPPING.values():
+        if model_class in get_values(MODEL_FOR_MULTIPLE_CHOICE_MAPPING):
             inputs_dict = {
                 k: v.unsqueeze(1).expand(-1, self.model_tester.num_choices, -1).contiguous()
                 if isinstance(v, torch.Tensor) and v.ndim > 1
@@ -434,9 +437,9 @@ class TapasModelTest(ModelTesterMixin, unittest.TestCase):
             }
 
         if return_labels:
-            if model_class in MODEL_FOR_MULTIPLE_CHOICE_MAPPING.values():
+            if model_class in get_values(MODEL_FOR_MULTIPLE_CHOICE_MAPPING):
                 inputs_dict["labels"] = torch.ones(self.model_tester.batch_size, dtype=torch.long, device=torch_device)
-            elif model_class in MODEL_FOR_TABLE_QUESTION_ANSWERING_MAPPING.values():
+            elif model_class in get_values(MODEL_FOR_TABLE_QUESTION_ANSWERING_MAPPING):
                 inputs_dict["labels"] = torch.zeros(
                     (self.model_tester.batch_size, self.model_tester.seq_length), dtype=torch.long, device=torch_device
                 )
@@ -457,17 +460,17 @@ class TapasModelTest(ModelTesterMixin, unittest.TestCase):
                     self.model_tester.batch_size, dtype=torch.float, device=torch_device
                 )
             elif model_class in [
-                *MODEL_FOR_SEQUENCE_CLASSIFICATION_MAPPING.values(),
-                *MODEL_FOR_NEXT_SENTENCE_PREDICTION_MAPPING.values(),
+                *get_values(MODEL_FOR_SEQUENCE_CLASSIFICATION_MAPPING),
+                *get_values(MODEL_FOR_NEXT_SENTENCE_PREDICTION_MAPPING),
             ]:
                 inputs_dict["labels"] = torch.zeros(
                     self.model_tester.batch_size, dtype=torch.long, device=torch_device
                 )
             elif model_class in [
-                *MODEL_FOR_TOKEN_CLASSIFICATION_MAPPING.values(),
-                *MODEL_FOR_CAUSAL_LM_MAPPING.values(),
-                *MODEL_FOR_MASKED_LM_MAPPING.values(),
-                *MODEL_FOR_SEQ_TO_SEQ_CAUSAL_LM_MAPPING.values(),
+                *get_values(MODEL_FOR_TOKEN_CLASSIFICATION_MAPPING),
+                *get_values(MODEL_FOR_CAUSAL_LM_MAPPING),
+                *get_values(MODEL_FOR_MASKED_LM_MAPPING),
+                *get_values(MODEL_FOR_SEQ_TO_SEQ_CAUSAL_LM_MAPPING),
             ]:
                 inputs_dict["labels"] = torch.zeros(
                     (self.model_tester.batch_size, self.model_tester.seq_length), dtype=torch.long, device=torch_device
@@ -540,9 +543,6 @@ def prepare_tapas_batch_inputs_for_training():
     return table, queries, answer_coordinates, answer_text, float_answer
 
 
-TOLERANCE = 1
-
-
 @require_torch
 @require_scatter
 class TapasModelIntegrationTest(unittest.TestCase):
@@ -574,12 +574,12 @@ class TapasModelIntegrationTest(unittest.TestCase):
             device=torch_device,
         )
 
-        self.assertTrue(torch.allclose(outputs.last_hidden_state[:, :3, :3], expected_slice, atol=TOLERANCE))
+        self.assertTrue(torch.allclose(outputs.last_hidden_state[:, :3, :3], expected_slice, atol=0.0005))
 
         # test the pooled output
         expected_slice = torch.tensor([[0.987518311, -0.970520139, -0.994303405]], device=torch_device)
 
-        self.assertTrue(torch.allclose(outputs.pooler_output[:, :3], expected_slice, atol=TOLERANCE))
+        self.assertTrue(torch.allclose(outputs.pooler_output[:, :3], expected_slice, atol=0.0005))
 
     @unittest.skip(reason="Model not available yet")
     def test_inference_masked_lm(self):
@@ -634,7 +634,7 @@ class TapasModelIntegrationTest(unittest.TestCase):
             device=torch_device,
         )
 
-        self.assertTrue(torch.allclose(logits, expected_tensor, atol=TOLERANCE))
+        self.assertTrue(torch.allclose(logits, expected_tensor, atol=0.015))
 
     @slow
     def test_inference_question_answering_head_conversational_absolute_embeddings(self):
@@ -683,7 +683,7 @@ class TapasModelIntegrationTest(unittest.TestCase):
             device=torch_device,
         )
 
-        self.assertTrue(torch.allclose(logits, expected_tensor, atol=TOLERANCE))
+        self.assertTrue(torch.allclose(logits, expected_tensor, atol=0.01))
 
     @slow
     def test_inference_question_answering_head_weak_supervision(self):
@@ -710,7 +710,7 @@ class TapasModelIntegrationTest(unittest.TestCase):
             device=torch_device,
         )
 
-        self.assertTrue(torch.allclose(logits[:, -6:], expected_slice, atol=TOLERANCE))
+        self.assertTrue(torch.allclose(logits[:, -6:], expected_slice, atol=0.4))
 
         # test the aggregation logits
         logits_aggregation = outputs.logits_aggregation
@@ -721,7 +721,7 @@ class TapasModelIntegrationTest(unittest.TestCase):
             device=torch_device,
         )
 
-        self.assertTrue(torch.allclose(logits_aggregation, expected_tensor, atol=TOLERANCE))
+        self.assertTrue(torch.allclose(logits_aggregation, expected_tensor, atol=0.001))
 
         # test the predicted answer coordinates and aggregation indices
         EXPECTED_PREDICTED_ANSWER_COORDINATES = [[(0, 0)], [(1, 2)]]
@@ -778,7 +778,7 @@ class TapasModelIntegrationTest(unittest.TestCase):
         # test the loss
         loss = outputs.loss
         expected_loss = torch.tensor(3.3527612686157227e-08, device=torch_device)
-        self.assertTrue(torch.allclose(loss, expected_loss, atol=TOLERANCE))
+        self.assertTrue(torch.allclose(loss, expected_loss, atol=1e-6))
 
         # test the logits on the first example
         logits = outputs.logits
@@ -799,7 +799,7 @@ class TapasModelIntegrationTest(unittest.TestCase):
             device=torch_device,
         )
 
-        self.assertTrue(torch.allclose(logits[0, -9:], expected_slice, atol=TOLERANCE))
+        self.assertTrue(torch.allclose(logits[0, -9:], expected_slice, atol=1e-6))
 
         # test the aggregation logits on the second example
         logits_aggregation = outputs.logits_aggregation
@@ -807,7 +807,7 @@ class TapasModelIntegrationTest(unittest.TestCase):
         self.assertEqual(logits_aggregation.shape, expected_shape)
         expected_slice = torch.tensor([-4.0538, 40.0304, -5.3554, 23.3965], device=torch_device)
 
-        self.assertTrue(torch.allclose(logits_aggregation[1, -4:], expected_slice, atol=TOLERANCE))
+        self.assertTrue(torch.allclose(logits_aggregation[1, -4:], expected_slice, atol=1e-4))
 
     @slow
     def test_inference_question_answering_head_strong_supervision(self):
@@ -854,7 +854,7 @@ class TapasModelIntegrationTest(unittest.TestCase):
             device=torch_device,
         )
 
-        self.assertTrue(torch.allclose(logits, expected_tensor, atol=TOLERANCE))
+        self.assertTrue(torch.allclose(logits, expected_tensor, atol=0.02))
 
         # test the aggregation logits
         logits_aggregation = outputs.logits_aggregation
@@ -864,7 +864,7 @@ class TapasModelIntegrationTest(unittest.TestCase):
             [[16.5659733, -3.06624889, -2.34152961, -0.970244825]], device=torch_device
         )  # PyTorch model outputs [[16.5679, -3.0668, -2.3442, -0.9674]]
 
-        self.assertTrue(torch.allclose(logits_aggregation, expected_tensor, atol=TOLERANCE))
+        self.assertTrue(torch.allclose(logits_aggregation, expected_tensor, atol=0.003))
 
     @slow
     def test_inference_classification_head(self):
@@ -885,7 +885,7 @@ class TapasModelIntegrationTest(unittest.TestCase):
             [[0.795137286, 9.5572]], device=torch_device
         )  # Note that the PyTorch model outputs [[0.8057, 9.5281]]
 
-        self.assertTrue(torch.allclose(outputs.logits, expected_tensor, atol=TOLERANCE))
+        self.assertTrue(torch.allclose(outputs.logits, expected_tensor, atol=0.05))
 
 
 # Below: tests for Tapas utilities which are defined in modeling_tapas.py.

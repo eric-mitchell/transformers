@@ -15,25 +15,75 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from typing import TYPE_CHECKING
 
-from ...file_utils import is_tf_available, is_tokenizers_available, is_torch_available
-from .configuration_bart import BartConfig
-from .tokenization_bart import BartTokenizer
+from ...file_utils import _LazyModule, is_flax_available, is_tf_available, is_tokenizers_available, is_torch_available
 
+
+_import_structure = {
+    "configuration_bart": ["BART_PRETRAINED_CONFIG_ARCHIVE_MAP", "BartConfig", "BartOnnxConfig"],
+    "tokenization_bart": ["BartTokenizer"],
+}
 
 if is_tokenizers_available():
-    from .tokenization_bart_fast import BartTokenizerFast
+    _import_structure["tokenization_bart_fast"] = ["BartTokenizerFast"]
 
 if is_torch_available():
-    from .modeling_bart import (
-        BART_PRETRAINED_MODEL_ARCHIVE_LIST,
-        BartForConditionalGeneration,
-        BartForQuestionAnswering,
-        BartForSequenceClassification,
-        BartModel,
-        BartPretrainedModel,
-        PretrainedBartModel,
-    )
+    _import_structure["modeling_bart"] = [
+        "BART_PRETRAINED_MODEL_ARCHIVE_LIST",
+        "BartForCausalLM",
+        "BartForConditionalGeneration",
+        "BartForQuestionAnswering",
+        "BartForSequenceClassification",
+        "BartModel",
+        "BartPretrainedModel",
+        "PretrainedBartModel",
+    ]
 
 if is_tf_available():
-    from .modeling_tf_bart import TFBartForConditionalGeneration, TFBartModel, TFBartPretrainedModel
+    _import_structure["modeling_tf_bart"] = ["TFBartForConditionalGeneration", "TFBartModel", "TFBartPretrainedModel"]
+
+if is_flax_available():
+    _import_structure["modeling_flax_bart"] = [
+        "FlaxBartForConditionalGeneration",
+        "FlaxBartForQuestionAnswering",
+        "FlaxBartForSequenceClassification",
+        "FlaxBartModel",
+        "FlaxBartPreTrainedModel",
+    ]
+
+if TYPE_CHECKING:
+    from .configuration_bart import BART_PRETRAINED_CONFIG_ARCHIVE_MAP, BartConfig, BartOnnxConfig
+    from .tokenization_bart import BartTokenizer
+
+    if is_tokenizers_available():
+        from .tokenization_bart_fast import BartTokenizerFast
+
+    if is_torch_available():
+        from .modeling_bart import (
+            BART_PRETRAINED_MODEL_ARCHIVE_LIST,
+            BartForCausalLM,
+            BartForConditionalGeneration,
+            BartForQuestionAnswering,
+            BartForSequenceClassification,
+            BartModel,
+            BartPretrainedModel,
+            PretrainedBartModel,
+        )
+
+    if is_tf_available():
+        from .modeling_tf_bart import TFBartForConditionalGeneration, TFBartModel, TFBartPretrainedModel
+
+    if is_flax_available():
+        from .modeling_flax_bart import (
+            FlaxBartForConditionalGeneration,
+            FlaxBartForQuestionAnswering,
+            FlaxBartForSequenceClassification,
+            FlaxBartModel,
+            FlaxBartPreTrainedModel,
+        )
+
+else:
+    import sys
+
+    sys.modules[__name__] = _LazyModule(__name__, globals()["__file__"], _import_structure)

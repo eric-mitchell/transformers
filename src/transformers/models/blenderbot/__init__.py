@@ -16,17 +16,55 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from ...file_utils import is_tf_available, is_torch_available
-from .configuration_blenderbot import BLENDERBOT_PRETRAINED_CONFIG_ARCHIVE_MAP, BlenderbotConfig
-from .tokenization_blenderbot import BlenderbotSmallTokenizer, BlenderbotTokenizer
+from typing import TYPE_CHECKING
 
+from ...file_utils import _LazyModule, is_tf_available, is_torch_available
+
+
+_import_structure = {
+    "configuration_blenderbot": ["BLENDERBOT_PRETRAINED_CONFIG_ARCHIVE_MAP", "BlenderbotConfig"],
+    "tokenization_blenderbot": ["BlenderbotTokenizer"],
+}
 
 if is_torch_available():
-    from .modeling_blenderbot import (
-        BLENDERBOT_PRETRAINED_MODEL_ARCHIVE_LIST,
-        BlenderbotForConditionalGeneration,
-        BlenderbotModel,
-    )
+    _import_structure["modeling_blenderbot"] = [
+        "BLENDERBOT_PRETRAINED_MODEL_ARCHIVE_LIST",
+        "BlenderbotForCausalLM",
+        "BlenderbotForConditionalGeneration",
+        "BlenderbotModel",
+        "BlenderbotPreTrainedModel",
+    ]
+
 
 if is_tf_available():
-    from .modeling_tf_blenderbot import TFBlenderbotForConditionalGeneration
+    _import_structure["modeling_tf_blenderbot"] = [
+        "TFBlenderbotForConditionalGeneration",
+        "TFBlenderbotModel",
+        "TFBlenderbotPreTrainedModel",
+    ]
+
+
+if TYPE_CHECKING:
+    from .configuration_blenderbot import BLENDERBOT_PRETRAINED_CONFIG_ARCHIVE_MAP, BlenderbotConfig
+    from .tokenization_blenderbot import BlenderbotTokenizer
+
+    if is_torch_available():
+        from .modeling_blenderbot import (
+            BLENDERBOT_PRETRAINED_MODEL_ARCHIVE_LIST,
+            BlenderbotForCausalLM,
+            BlenderbotForConditionalGeneration,
+            BlenderbotModel,
+            BlenderbotPreTrainedModel,
+        )
+
+    if is_tf_available():
+        from .modeling_tf_blenderbot import (
+            TFBlenderbotForConditionalGeneration,
+            TFBlenderbotModel,
+            TFBlenderbotPreTrainedModel,
+        )
+
+else:
+    import sys
+
+    sys.modules[__name__] = _LazyModule(__name__, globals()["__file__"], _import_structure)

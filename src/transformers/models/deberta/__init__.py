@@ -16,15 +16,73 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from ...file_utils import is_torch_available
-from .configuration_deberta import DEBERTA_PRETRAINED_CONFIG_ARCHIVE_MAP, DebertaConfig
-from .tokenization_deberta import DebertaTokenizer
+from typing import TYPE_CHECKING
 
+from ...file_utils import _LazyModule, is_tf_available, is_tokenizers_available, is_torch_available
+
+
+_import_structure = {
+    "configuration_deberta": ["DEBERTA_PRETRAINED_CONFIG_ARCHIVE_MAP", "DebertaConfig"],
+    "tokenization_deberta": ["DebertaTokenizer"],
+}
+
+if is_tokenizers_available():
+    _import_structure["tokenization_deberta_fast"] = ["DebertaTokenizerFast"]
 
 if is_torch_available():
-    from .modeling_deberta import (
-        DEBERTA_PRETRAINED_MODEL_ARCHIVE_LIST,
-        DebertaForSequenceClassification,
-        DebertaModel,
-        DebertaPreTrainedModel,
-    )
+    _import_structure["modeling_deberta"] = [
+        "DEBERTA_PRETRAINED_MODEL_ARCHIVE_LIST",
+        "DebertaForMaskedLM",
+        "DebertaForQuestionAnswering",
+        "DebertaForSequenceClassification",
+        "DebertaForTokenClassification",
+        "DebertaModel",
+        "DebertaPreTrainedModel",
+    ]
+
+if is_tf_available():
+    _import_structure["modeling_tf_deberta"] = [
+        "TF_DEBERTA_PRETRAINED_MODEL_ARCHIVE_LIST",
+        "TFDebertaForMaskedLM",
+        "TFDebertaForQuestionAnswering",
+        "TFDebertaForSequenceClassification",
+        "TFDebertaForTokenClassification",
+        "TFDebertaModel",
+        "TFDebertaPreTrainedModel",
+    ]
+
+
+if TYPE_CHECKING:
+    from .configuration_deberta import DEBERTA_PRETRAINED_CONFIG_ARCHIVE_MAP, DebertaConfig
+    from .tokenization_deberta import DebertaTokenizer
+
+    if is_tokenizers_available():
+        from .tokenization_deberta_fast import DebertaTokenizerFast
+
+    if is_torch_available():
+        from .modeling_deberta import (
+            DEBERTA_PRETRAINED_MODEL_ARCHIVE_LIST,
+            DebertaForMaskedLM,
+            DebertaForQuestionAnswering,
+            DebertaForSequenceClassification,
+            DebertaForTokenClassification,
+            DebertaModel,
+            DebertaPreTrainedModel,
+        )
+
+    if is_tf_available():
+        from .modeling_tf_deberta import (
+            TF_DEBERTA_PRETRAINED_MODEL_ARCHIVE_LIST,
+            TFDebertaForMaskedLM,
+            TFDebertaForQuestionAnswering,
+            TFDebertaForSequenceClassification,
+            TFDebertaForTokenClassification,
+            TFDebertaModel,
+            TFDebertaPreTrainedModel,
+        )
+
+
+else:
+    import sys
+
+    sys.modules[__name__] = _LazyModule(__name__, globals()["__file__"], _import_structure)

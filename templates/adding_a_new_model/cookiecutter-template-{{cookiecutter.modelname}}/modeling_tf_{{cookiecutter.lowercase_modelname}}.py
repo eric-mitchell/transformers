@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright {{cookiecutter.authors}} and The HuggingFace Inc. team. All rights reserved.
+# Copyright 2021 {{cookiecutter.authors}} and The HuggingFace Inc. team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -16,10 +16,11 @@
 
 {% if cookiecutter.is_encoder_decoder_model == "False" %}
 
+import math
+from typing import Dict, Optional, Tuple, Union
 
+import numpy as np
 import tensorflow as tf
-
-from transformers.modeling_tf_outputs import TFCausalLMOutput
 
 from ...activations_tf import get_tf_activation
 from ...file_utils import (
@@ -31,6 +32,7 @@ from ...file_utils import (
 from ...modeling_tf_outputs import (
     TFBaseModelOutput,
     TFBaseModelOutputWithPooling,
+    TFCausalLMOutput,
     TFMaskedLMOutput,
     TFMultipleChoiceModelOutput,
     TFQuestionAnsweringModelOutput,
@@ -40,6 +42,7 @@ from ...modeling_tf_outputs import (
 from ...modeling_tf_utils import (
     TFCausalLanguageModelingLoss,
     TFMaskedLanguageModelingLoss,
+    TFModelInputType,
     TFMultipleChoiceLoss,
     TFPreTrainedModel,
     TFQuestionAnsweringLoss,
@@ -57,6 +60,7 @@ from .configuration_{{cookiecutter.lowercase_modelname}} import {{cookiecutter.c
 
 logger = logging.get_logger(__name__)
 
+_CHECKPOINT_FOR_DOC = "{{cookiecutter.checkpoint_identifier}}"
 _CONFIG_FOR_DOC = "{{cookiecutter.camelcase_modelname}}Config"
 _TOKENIZER_FOR_DOC = "{{cookiecutter.camelcase_modelname}}Tokenizer"
 
@@ -70,38 +74,37 @@ TF_{{cookiecutter.uppercase_modelname}}_PRETRAINED_MODEL_ARCHIVE_LIST = [
 class TF{{cookiecutter.camelcase_modelname}}Embeddings(tf.keras.layers.Layer):
     """Construct the embeddings from word, position and token_type embeddings."""
 
-    def __init__(self, config, **kwargs):
+    def __init__(self, config: {{cookiecutter.camelcase_modelname}}Config, **kwargs):
         super().__init__(**kwargs)
 
         self.vocab_size = config.vocab_size
+        self.type_vocab_size = config.type_vocab_size
         self.hidden_size = config.hidden_size
+        self.max_position_embeddings = config.max_position_embeddings
         self.initializer_range = config.initializer_range
-        self.position_embeddings = tf.keras.layers.Embedding(
-            config.max_position_embeddings,
-            config.hidden_size,
-            embeddings_initializer=get_initializer(self.initializer_range),
-            name="position_embeddings",
-        )
-        self.token_type_embeddings = tf.keras.layers.Embedding(
-            config.type_vocab_size,
-            config.hidden_size,
-            embeddings_initializer=get_initializer(self.initializer_range),
-            name="token_type_embeddings",
-        )
-
-        # self.LayerNorm is not snake-cased to stick with TensorFlow model variable name and be able to load
-        # any TensorFlow checkpoint file
+        self.embeddings_sum = tf.keras.layers.Add()
         self.LayerNorm = tf.keras.layers.LayerNormalization(epsilon=config.layer_norm_eps, name="LayerNorm")
-        self.dropout = tf.keras.layers.Dropout(config.hidden_dropout_prob)
+        self.dropout = tf.keras.layers.Dropout(rate=config.hidden_dropout_prob)
 
-    def build(self, input_shape):
-        """Build shared word embedding layer """
+    def build(self, input_shape: tf.TensorShape):
         with tf.name_scope("word_embeddings"):
-            # Create and initialize weights. The random normal initializer was chosen
-            # arbitrarily, and works well.
-            self.word_embeddings = self.add_weight(
-                "weight",
+            self.weight = self.add_weight(
+                name="weight",
                 shape=[self.vocab_size, self.hidden_size],
+                initializer=get_initializer(self.initializer_range),
+            )
+
+        with tf.name_scope("token_type_embeddings"):
+            self.token_type_embeddings = self.add_weight(
+                name="embeddings",
+                shape=[self.type_vocab_size, self.hidden_size],
+                initializer=get_initializer(self.initializer_range),
+            )
+
+        with tf.name_scope("position_embeddings"):
+            self.position_embeddings = self.add_weight(
+                name="embeddings",
+                shape=[self.max_position_embeddings, self.hidden_size],
                 initializer=get_initializer(self.initializer_range),
             )
 
@@ -109,155 +112,44 @@ class TF{{cookiecutter.camelcase_modelname}}Embeddings(tf.keras.layers.Layer):
 
     def call(
         self,
-        input_ids=None,
-        position_ids=None,
-        token_type_ids=None,
-        inputs_embeds=None,
-        mode="embedding",
-        training=False,
-    ):
+        input_ids: tf.Tensor = None,
+        position_ids: tf.Tensor = None,
+        token_type_ids: tf.Tensor = None,
+        inputs_embeds: tf.Tensor = None,
+        training: bool = False,
+    ) -> tf.Tensor:
         """
-        Get token embeddings of inputs.
-
-        Args:
-            inputs: list of three int64 tensors with shape [batch_size, length]: (input_ids, position_ids, token_type_ids)
-            mode: string, a valid value is one of "embedding" and "linear".
+        Applies embedding based on inputs tensor.
 
         Returns:
-            outputs: If mode == "embedding", output embedding tensor, float32 with shape [batch_size, length,
-            embedding_size]; if mode == "linear", output linear tensor, float32 with shape [batch_size, length,
-            vocab_size].
-
-        Raises:
-            ValueError: if mode is not valid.
-
-        Shared weights logic adapted from
-        https://github.com/tensorflow/models/blob/a009f4fb9d2fc4949e32192a944688925ef78659/official/transformer/v2/embedding_layer.py#L24
+            final_embeddings (:obj:`tf.Tensor`): output embedding tensor.
         """
-        if mode == "embedding":
-            return self._embedding(input_ids, position_ids, token_type_ids, inputs_embeds, training=training)
-        elif mode == "linear":
-            return self._linear(input_ids)
-        else:
-            raise ValueError("mode {} is not valid.".format(mode))
-
-    def _embedding(self, input_ids, position_ids, token_type_ids, inputs_embeds, training=False):
-        """Applies embedding based on inputs tensor."""
         assert not (input_ids is None and inputs_embeds is None)
 
         if input_ids is not None:
-            input_shape = shape_list(input_ids)
-        else:
-            input_shape = shape_list(inputs_embeds)[:-1]
+            inputs_embeds = tf.gather(params=self.weight, indices=input_ids)
 
-        seq_length = input_shape[1]
-
-        if position_ids is None:
-            position_ids = tf.range(seq_length, dtype=tf.int32)[tf.newaxis, :]
+        input_shape = shape_list(inputs_embeds)[:-1]
 
         if token_type_ids is None:
-            token_type_ids = tf.fill(input_shape, 0)
+            token_type_ids = tf.fill(dims=input_shape, value=0)
 
-        if inputs_embeds is None:
-            inputs_embeds = tf.gather(self.word_embeddings, input_ids)
+        if position_ids is None:
+            position_ids = tf.expand_dims(tf.range(start=0, limit=input_shape[-1]), axis=0)
 
-        position_embeddings = tf.cast(self.position_embeddings(position_ids), inputs_embeds.dtype)
-        token_type_embeddings = tf.cast(self.token_type_embeddings(token_type_ids), inputs_embeds.dtype)
-        embeddings = inputs_embeds + position_embeddings + token_type_embeddings
-        embeddings = self.LayerNorm(embeddings)
-        embeddings = self.dropout(embeddings, training=training)
+        position_embeds = tf.gather(params=self.position_embeddings, indices=position_ids)
+        position_embeds = tf.tile(input=position_embeds, multiples=(input_shape[0], 1, 1))
+        token_type_embeds = tf.gather(params=self.token_type_embeddings, indices=token_type_ids)
+        final_embeddings = self.embeddings_sum(inputs=[inputs_embeds, position_embeds, token_type_embeds])
+        final_embeddings = self.LayerNorm(inputs=final_embeddings)
+        final_embeddings = self.dropout(inputs=final_embeddings, training=training)
 
-        return embeddings
-
-    def _linear(self, inputs):
-        """
-        Computes logits by running inputs through a linear layer.
-
-        Args:
-            inputs: A float32 tensor with shape [batch_size, length, hidden_size].
-
-        Returns:
-            float32 tensor with shape [batch_size, length, vocab_size].
-        """
-        batch_size = shape_list(inputs)[0]
-        length = shape_list(inputs)[1]
-        x = tf.reshape(inputs, [-1, self.hidden_size])
-        logits = tf.matmul(x, self.word_embeddings, transpose_b=True)
-
-        return tf.reshape(logits, [batch_size, length, self.vocab_size])
+        return final_embeddings
 
 
 # Copied from transformers.models.bert.modeling_tf_bert.TFBertSelfAttention with Bert->{{cookiecutter.camelcase_modelname}}
 class TF{{cookiecutter.camelcase_modelname}}SelfAttention(tf.keras.layers.Layer):
-    def __init__(self, config, **kwargs):
-        super().__init__(**kwargs)
-
-        if config.hidden_size % config.num_attention_heads != 0:
-            raise ValueError(
-                f"The hidden size ({config.hidden_size}) is not a multiple of the number "
-                f"of attention heads ({config.num_attention_heads})"
-            )
-
-        self.num_attention_heads = config.num_attention_heads
-        self.attention_head_size = int(config.hidden_size / config.num_attention_heads)
-        self.query = tf.keras.layers.experimental.EinsumDense(
-            equation="abc,cde->abde",
-            output_shape=(None, config.num_attention_heads, self.attention_head_size),
-            bias_axes="de",
-            kernel_initializer=get_initializer(initializer_range=config.initializer_range),
-            name="query",
-        )
-        self.key = tf.keras.layers.experimental.EinsumDense(
-            equation="abc,cde->abde",
-            output_shape=(None, config.num_attention_heads, self.attention_head_size),
-            bias_axes="de",
-            kernel_initializer=get_initializer(initializer_range=config.initializer_range),
-            name="key",
-        )
-        self.value = tf.keras.layers.experimental.EinsumDense(
-            equation="abc,cde->abde",
-            output_shape=(None, config.num_attention_heads, self.attention_head_size),
-            bias_axes="de",
-            kernel_initializer=get_initializer(initializer_range=config.initializer_range),
-            name="value",
-        )
-        self.dropout = tf.keras.layers.Dropout(rate=config.attention_probs_dropout_prob)
-
-    def call(self, hidden_states, attention_mask=None, head_mask=None, output_attentions=False, training=False):
-        query_layer = self.query(inputs=hidden_states)
-        key_layer = self.key(inputs=hidden_states)
-        value_layer = self.value(inputs=hidden_states)
-
-        # Take the dot product between "query" and "key" to get the raw
-        # attention scores.
-        dk = tf.cast(x=self.attention_head_size, dtype=query_layer.dtype)
-        query_layer = tf.multiply(x=query_layer, y=tf.math.rsqrt(x=dk))
-        attention_scores = tf.einsum("aecd,abcd->acbe", key_layer, query_layer)
-
-        if attention_mask is not None:
-            # Apply the attention mask is (precomputed for all layers in TF{{cookiecutter.camelcase_modelname}}Model call() function)
-            attention_scores = attention_scores + attention_mask
-
-        # Normalize the attention scores to probabilities.
-        attention_probs = tf.nn.softmax(logits=attention_scores, axis=-1)
-
-        # This is actually dropping out entire tokens to attend to, which might
-        # seem a bit unusual, but is taken from the original Transformer paper.
-        attention_probs = self.dropout(attention_probs, training=training)
-
-        # Mask heads if we want to
-        if head_mask is not None:
-            attention_scores = attention_scores * head_mask
-
-        attention_output = tf.einsum("acbe,aecd->abcd", attention_probs, value_layer)
-        outputs = (attention_output, attention_probs) if output_attentions else (attention_output,)
-
-        return outputs
-
-
-# Copied from transformers.models.bert.modeling_tf_bert.TFBertSelfOutput with Bert->{{cookiecutter.camelcase_modelname}}
-class TF{{cookiecutter.camelcase_modelname}}SelfOutput(tf.keras.layers.Layer):
-    def __init__(self, config, **kwargs):
+    def __init__(self, config: {{cookiecutter.camelcase_modelname}}Config, **kwargs):
         super().__init__(**kwargs)
 
         if config.hidden_size % config.num_attention_heads != 0:
@@ -269,17 +161,85 @@ class TF{{cookiecutter.camelcase_modelname}}SelfOutput(tf.keras.layers.Layer):
         self.num_attention_heads = config.num_attention_heads
         self.attention_head_size = int(config.hidden_size / config.num_attention_heads)
         self.all_head_size = self.num_attention_heads * self.attention_head_size
-        self.dense = tf.keras.layers.experimental.EinsumDense(
-            equation="abcd,cde->abe",
-            output_shape=(None, self.all_head_size),
-            bias_axes="e",
-            kernel_initializer=get_initializer(initializer_range=config.initializer_range),
-            name="dense",
+        self.sqrt_att_head_size = math.sqrt(self.attention_head_size)
+
+        self.query = tf.keras.layers.Dense(
+            units=self.all_head_size, kernel_initializer=get_initializer(config.initializer_range), name="query"
+        )
+        self.key = tf.keras.layers.Dense(
+            units=self.all_head_size, kernel_initializer=get_initializer(config.initializer_range), name="key"
+        )
+        self.value = tf.keras.layers.Dense(
+            units=self.all_head_size, kernel_initializer=get_initializer(config.initializer_range), name="value"
+        )
+        self.dropout = tf.keras.layers.Dropout(rate=config.attention_probs_dropout_prob)
+
+    def transpose_for_scores(self, tensor: tf.Tensor, batch_size: int) -> tf.Tensor:
+        # Reshape from [batch_size, seq_length, all_head_size] to [batch_size, seq_length, num_attention_heads, attention_head_size]
+        tensor = tf.reshape(tensor=tensor, shape=(batch_size, -1, self.num_attention_heads, self.attention_head_size))
+
+        # Transpose the tensor from [batch_size, seq_length, num_attention_heads, attention_head_size] to [batch_size, num_attention_heads, seq_length, attention_head_size]
+        return tf.transpose(tensor, perm=[0, 2, 1, 3])
+
+    def call(
+        self,
+        hidden_states: tf.Tensor,
+        attention_mask: tf.Tensor,
+        head_mask: tf.Tensor,
+        output_attentions: bool,
+        training: bool = False,
+    ) -> Tuple[tf.Tensor]:
+        batch_size = shape_list(hidden_states)[0]
+        mixed_query_layer = self.query(inputs=hidden_states)
+        mixed_key_layer = self.key(inputs=hidden_states)
+        mixed_value_layer = self.value(inputs=hidden_states)
+        query_layer = self.transpose_for_scores(mixed_query_layer, batch_size)
+        key_layer = self.transpose_for_scores(mixed_key_layer, batch_size)
+        value_layer = self.transpose_for_scores(mixed_value_layer, batch_size)
+
+        # Take the dot product between "query" and "key" to get the raw attention scores.
+        # (batch size, num_heads, seq_len_q, seq_len_k)
+        attention_scores = tf.matmul(query_layer, key_layer, transpose_b=True)
+        dk = tf.cast(self.sqrt_att_head_size, dtype=attention_scores.dtype)
+        attention_scores = tf.divide(attention_scores, dk)
+
+        if attention_mask is not None:
+            # Apply the attention mask is (precomputed for all layers in TF{{cookiecutter.camelcase_modelname}}Model call() function)
+            attention_scores = tf.add(attention_scores, attention_mask)
+
+        # Normalize the attention scores to probabilities.
+        attention_probs = tf.nn.softmax(logits=attention_scores, axis=-1)
+
+        # This is actually dropping out entire tokens to attend to, which might
+        # seem a bit unusual, but is taken from the original Transformer paper.
+        attention_probs = self.dropout(inputs=attention_probs, training=training)
+
+        # Mask heads if we want to
+        if head_mask is not None:
+            attention_probs = tf.multiply(attention_probs, head_mask)
+
+        attention_output = tf.matmul(attention_probs, value_layer)
+        attention_output = tf.transpose(attention_output, perm=[0, 2, 1, 3])
+
+        # (batch_size, seq_len_q, all_head_size)
+        attention_output = tf.reshape(tensor=attention_output, shape=(batch_size, -1, self.all_head_size))
+        outputs = (attention_output, attention_probs) if output_attentions else (attention_output,)
+
+        return outputs
+
+
+# Copied from transformers.models.bert.modeling_tf_bert.TFBertSelfOutput with Bert->{{cookiecutter.camelcase_modelname}}
+class TF{{cookiecutter.camelcase_modelname}}SelfOutput(tf.keras.layers.Layer):
+    def __init__(self, config: {{cookiecutter.camelcase_modelname}}Config, **kwargs):
+        super().__init__(**kwargs)
+
+        self.dense = tf.keras.layers.Dense(
+            units=config.hidden_size, kernel_initializer=get_initializer(config.initializer_range), name="dense"
         )
         self.LayerNorm = tf.keras.layers.LayerNormalization(epsilon=config.layer_norm_eps, name="LayerNorm")
         self.dropout = tf.keras.layers.Dropout(rate=config.hidden_dropout_prob)
 
-    def call(self, hidden_states, input_tensor, training=False):
+    def call(self, hidden_states: tf.Tensor, input_tensor: tf.Tensor, training: bool = False) -> tf.Tensor:
         hidden_states = self.dense(inputs=hidden_states)
         hidden_states = self.dropout(inputs=hidden_states, training=training)
         hidden_states = self.LayerNorm(inputs=hidden_states + input_tensor)
@@ -289,7 +249,7 @@ class TF{{cookiecutter.camelcase_modelname}}SelfOutput(tf.keras.layers.Layer):
 
 # Copied from transformers.models.bert.modeling_tf_bert.TFBertAttention with Bert->{{cookiecutter.camelcase_modelname}}
 class TF{{cookiecutter.camelcase_modelname}}Attention(tf.keras.layers.Layer):
-    def __init__(self, config, **kwargs):
+    def __init__(self, config: {{cookiecutter.camelcase_modelname}}Config, **kwargs):
         super().__init__(**kwargs)
 
         self.self_attention = TF{{cookiecutter.camelcase_modelname}}SelfAttention(config, name="self")
@@ -298,11 +258,24 @@ class TF{{cookiecutter.camelcase_modelname}}Attention(tf.keras.layers.Layer):
     def prune_heads(self, heads):
         raise NotImplementedError
 
-    def call(self, input_tensor, attention_mask, head_mask, output_attentions, training=False):
+    def call(
+        self,
+        input_tensor: tf.Tensor,
+        attention_mask: tf.Tensor,
+        head_mask: tf.Tensor,
+        output_attentions: bool,
+        training: bool = False,
+    ) -> Tuple[tf.Tensor]:
         self_outputs = self.self_attention(
-            input_tensor, attention_mask, head_mask, output_attentions, training=training
+            hidden_states=input_tensor,
+            attention_mask=attention_mask,
+            head_mask=head_mask,
+            output_attentions=output_attentions,
+            training=training,
         )
-        attention_output = self.dense_output(self_outputs[0], input_tensor, training=training)
+        attention_output = self.dense_output(
+            hidden_states=self_outputs[0], input_tensor=input_tensor, training=training
+        )
         outputs = (attention_output,) + self_outputs[1:]  # add attentions if we output them
 
         return outputs
@@ -310,45 +283,37 @@ class TF{{cookiecutter.camelcase_modelname}}Attention(tf.keras.layers.Layer):
 
 # Copied from transformers.models.bert.modeling_tf_bert.TFBertIntermediate with Bert->{{cookiecutter.camelcase_modelname}}
 class TF{{cookiecutter.camelcase_modelname}}Intermediate(tf.keras.layers.Layer):
-    def __init__(self, config, **kwargs):
+    def __init__(self, config: {{cookiecutter.camelcase_modelname}}Config, **kwargs):
         super().__init__(**kwargs)
 
-        self.dense = tf.keras.layers.experimental.EinsumDense(
-            equation="abc,cd->abd",
-            output_shape=(None, config.intermediate_size),
-            bias_axes="d",
-            kernel_initializer=get_initializer(initializer_range=config.initializer_range),
-            name="dense",
+        self.dense = tf.keras.layers.Dense(
+            units=config.intermediate_size, kernel_initializer=get_initializer(config.initializer_range), name="dense"
         )
 
         if isinstance(config.hidden_act, str):
-            self.intermediate_act_fn = get_tf_activation(activation_string=config.hidden_act)
+            self.intermediate_act_fn = get_tf_activation(config.hidden_act)
         else:
             self.intermediate_act_fn = config.hidden_act
 
-    def call(self, hidden_states):
+    def call(self, hidden_states: tf.Tensor) -> tf.Tensor:
         hidden_states = self.dense(inputs=hidden_states)
-        hidden_states = self.intermediate_act_fn(inputs=hidden_states)
+        hidden_states = self.intermediate_act_fn(hidden_states)
 
         return hidden_states
 
 
 # Copied from transformers.models.bert.modeling_tf_bert.TFBertOutput with Bert->{{cookiecutter.camelcase_modelname}}
 class TF{{cookiecutter.camelcase_modelname}}Output(tf.keras.layers.Layer):
-    def __init__(self, config, **kwargs):
+    def __init__(self, config: {{cookiecutter.camelcase_modelname}}Config, **kwargs):
         super().__init__(**kwargs)
 
-        self.dense = tf.keras.layers.experimental.EinsumDense(
-            equation="abc,cd->abd",
-            bias_axes="d",
-            output_shape=(None, config.hidden_size),
-            kernel_initializer=get_initializer(config.initializer_range),
-            name="dense",
+        self.dense = tf.keras.layers.Dense(
+            units=config.hidden_size, kernel_initializer=get_initializer(config.initializer_range), name="dense"
         )
         self.LayerNorm = tf.keras.layers.LayerNormalization(epsilon=config.layer_norm_eps, name="LayerNorm")
         self.dropout = tf.keras.layers.Dropout(rate=config.hidden_dropout_prob)
 
-    def call(self, hidden_states, input_tensor, training=False):
+    def call(self, hidden_states: tf.Tensor, input_tensor: tf.Tensor, training: bool = False) -> tf.Tensor:
         hidden_states = self.dense(inputs=hidden_states)
         hidden_states = self.dropout(inputs=hidden_states, training=training)
         hidden_states = self.LayerNorm(inputs=hidden_states + input_tensor)
@@ -357,42 +322,53 @@ class TF{{cookiecutter.camelcase_modelname}}Output(tf.keras.layers.Layer):
 
 
 class TF{{cookiecutter.camelcase_modelname}}Layer(tf.keras.layers.Layer):
-    def __init__(self, config, **kwargs):
+    def __init__(self, config: {{cookiecutter.camelcase_modelname}}Config, **kwargs):
         super().__init__(**kwargs)
 
         self.attention = TF{{cookiecutter.camelcase_modelname}}Attention(config, name="attention")
         self.intermediate = TF{{cookiecutter.camelcase_modelname}}Intermediate(config, name="intermediate")
-        self.{{cookiecutter.lowercase_modelname}}_output = TF{{cookiecutter.camelcase_modelname}}Output(config, name="output")
+        self.bert_output = TF{{cookiecutter.camelcase_modelname}}Output(config, name="output")
 
-    # Copied from transformers.models.bert.modeling_tf_bert.TFBertLayer.call with bert->{{cookiecutter.lowercase_modelname}}
-    def call(self, hidden_states, attention_mask, head_mask, output_attentions, training=False):
+    def call(
+        self,
+        hidden_states: tf.Tensor,
+        attention_mask: tf.Tensor,
+        head_mask: tf.Tensor,
+        output_attentions: bool,
+        training: bool = False,
+    ) -> Tuple[tf.Tensor]:
         attention_outputs = self.attention(
-            hidden_states, attention_mask, head_mask, output_attentions, training=training
+            input_tensor=hidden_states,
+            attention_mask=attention_mask,
+            head_mask=head_mask,
+            output_attentions=output_attentions,
+            training=training,
         )
         attention_output = attention_outputs[0]
-        intermediate_output = self.intermediate(attention_output)
-        layer_output = self.{{cookiecutter.lowercase_modelname}}_output(intermediate_output, attention_output, training=training)
+        intermediate_output = self.intermediate(hidden_states=attention_output)
+        layer_output = self.bert_output(hidden_states=intermediate_output, input_tensor=attention_output, training=training)
         outputs = (layer_output,) + attention_outputs[1:]  # add attentions if we output them
 
         return outputs
 
+
 # Copied from transformers.models.bert.modeling_tf_bert.TFBertEncoder with Bert->{{cookiecutter.camelcase_modelname}}
 class TF{{cookiecutter.camelcase_modelname}}Encoder(tf.keras.layers.Layer):
-    def __init__(self, config, **kwargs):
+    def __init__(self, config: {{cookiecutter.camelcase_modelname}}Config, **kwargs):
         super().__init__(**kwargs)
 
-        self.layer = [TF{{cookiecutter.camelcase_modelname}}Layer(config, name="layer_._{}".format(i)) for i in range(config.num_hidden_layers)]
+        self.layer = [TF{{cookiecutter.camelcase_modelname}}Layer(config, name=f"layer_._{i}") for i in range(config.num_hidden_layers)]
 
     def call(
         self,
-        hidden_states,
-        attention_mask,
-        head_mask,
-        output_attentions,
-        output_hidden_states,
-        return_dict,
-        training=False,
-    ):
+        hidden_states: tf.Tensor,
+        attention_mask: tf.Tensor,
+        head_mask: tf.Tensor,
+        output_attentions: bool,
+        output_hidden_states: bool,
+        return_dict: bool,
+        training: bool = False,
+    ) -> Union[TFBaseModelOutput, Tuple[tf.Tensor]]:
         all_hidden_states = () if output_hidden_states else None
         all_attentions = () if output_attentions else None
 
@@ -401,7 +377,11 @@ class TF{{cookiecutter.camelcase_modelname}}Encoder(tf.keras.layers.Layer):
                 all_hidden_states = all_hidden_states + (hidden_states,)
 
             layer_outputs = layer_module(
-                hidden_states, attention_mask, head_mask[i], output_attentions, training=training
+                hidden_states=hidden_states,
+                attention_mask=attention_mask,
+                head_mask=head_mask[i],
+                output_attentions=output_attentions,
+                training=training,
             )
             hidden_states = layer_outputs[0]
 
@@ -420,13 +400,15 @@ class TF{{cookiecutter.camelcase_modelname}}Encoder(tf.keras.layers.Layer):
         )
 
 
-# Copied from transformers.models.bert.modeling_tf_bert.TFBertPredictionHead with Bert->{{cookiecutter.camelcase_modelname}}
+# Copied from transformers.models.bert.modeling_tf_bert.TFBertPredictionHeadTransform with Bert->{{cookiecutter.camelcase_modelname}}
 class TF{{cookiecutter.camelcase_modelname}}PredictionHeadTransform(tf.keras.layers.Layer):
-    def __init__(self, config, **kwargs):
+    def __init__(self, config: {{cookiecutter.camelcase_modelname}}Config, **kwargs):
         super().__init__(**kwargs)
 
         self.dense = tf.keras.layers.Dense(
-            config.hidden_size, kernel_initializer=get_initializer(config.initializer_range), name="dense"
+            units=config.hidden_size,
+            kernel_initializer=get_initializer(config.initializer_range),
+            name="dense",
         )
 
         if isinstance(config.hidden_act, str):
@@ -436,48 +418,67 @@ class TF{{cookiecutter.camelcase_modelname}}PredictionHeadTransform(tf.keras.lay
 
         self.LayerNorm = tf.keras.layers.LayerNormalization(epsilon=config.layer_norm_eps, name="LayerNorm")
 
-    def call(self, hidden_states):
-        hidden_states = self.dense(hidden_states)
+    def call(self, hidden_states: tf.Tensor) -> tf.Tensor:
+        hidden_states = self.dense(inputs=hidden_states)
         hidden_states = self.transform_act_fn(hidden_states)
-        hidden_states = self.LayerNorm(hidden_states)
+        hidden_states = self.LayerNorm(inputs=hidden_states)
 
         return hidden_states
 
 
 # Copied from transformers.models.bert.modeling_tf_bert.TFBertLMPredictionHead with Bert->{{cookiecutter.camelcase_modelname}}
 class TF{{cookiecutter.camelcase_modelname}}LMPredictionHead(tf.keras.layers.Layer):
-    def __init__(self, config, input_embeddings, **kwargs):
+    def __init__(self, config: {{cookiecutter.camelcase_modelname}}Config, input_embeddings: tf.keras.layers.Layer, **kwargs):
         super().__init__(**kwargs)
 
         self.vocab_size = config.vocab_size
+        self.hidden_size = config.hidden_size
+
         self.transform = TF{{cookiecutter.camelcase_modelname}}PredictionHeadTransform(config, name="transform")
 
         # The output weights are the same as the input embeddings, but there is
         # an output-only bias for each token.
         self.input_embeddings = input_embeddings
 
-    def build(self, input_shape):
+    def build(self, input_shape: tf.TensorShape):
         self.bias = self.add_weight(shape=(self.vocab_size,), initializer="zeros", trainable=True, name="bias")
 
         super().build(input_shape)
 
-    def call(self, hidden_states):
-        hidden_states = self.transform(hidden_states)
-        hidden_states = self.input_embeddings(hidden_states, mode="linear")
-        hidden_states = hidden_states + self.bias
+    def get_output_embeddings(self) -> tf.keras.layers.Layer:
+        return self.input_embeddings
+
+    def set_output_embeddings(self, value: tf.Variable):
+        self.input_embeddings.weight = value
+        self.input_embeddings.vocab_size = shape_list(value)[0]
+
+    def get_bias(self) -> Dict[str, tf.Variable]:
+        return {"bias": self.bias}
+
+    def set_bias(self, value: tf.Variable):
+        self.bias = value["bias"]
+        self.vocab_size = shape_list(value["bias"])[0]
+
+    def call(self, hidden_states: tf.Tensor) -> tf.Tensor:
+        hidden_states = self.transform(hidden_states=hidden_states)
+        seq_length = shape_list(hidden_states)[1]
+        hidden_states = tf.reshape(tensor=hidden_states, shape=[-1, self.hidden_size])
+        hidden_states = tf.matmul(a=hidden_states, b=self.input_embeddings.weight, transpose_b=True)
+        hidden_states = tf.reshape(tensor=hidden_states, shape=[-1, seq_length, self.vocab_size])
+        hidden_states = tf.nn.bias_add(value=hidden_states, bias=self.bias)
 
         return hidden_states
 
 
 # Copied from transformers.models.bert.modeling_tf_bert.TFBertMLMHead with Bert->{{cookiecutter.camelcase_modelname}}
 class TF{{cookiecutter.camelcase_modelname}}MLMHead(tf.keras.layers.Layer):
-    def __init__(self, config, input_embeddings, **kwargs):
+    def __init__(self, config: {{cookiecutter.camelcase_modelname}}Config, input_embeddings: tf.keras.layers.Layer, **kwargs):
         super().__init__(**kwargs)
 
         self.predictions = TF{{cookiecutter.camelcase_modelname}}LMPredictionHead(config, input_embeddings, name="predictions")
 
-    def call(self, sequence_output):
-        prediction_scores = self.predictions(sequence_output)
+    def call(self, sequence_output: tf.Tensor) -> tf.Tensor:
+        prediction_scores = self.predictions(hidden_states=sequence_output)
 
         return prediction_scores
 
@@ -486,47 +487,45 @@ class TF{{cookiecutter.camelcase_modelname}}MLMHead(tf.keras.layers.Layer):
 class TF{{cookiecutter.camelcase_modelname}}MainLayer(tf.keras.layers.Layer):
     config_class = {{cookiecutter.camelcase_modelname}}Config
 
-    def __init__(self, config, **kwargs):
+    def __init__(self, config: {{cookiecutter.camelcase_modelname}}Config, add_pooling_layer: bool = True, **kwargs):
         super().__init__(**kwargs)
 
         self.config = config
-        self.num_hidden_layers = config.num_hidden_layers
-        self.initializer_range = config.initializer_range
-        self.output_attentions = config.output_attentions
-        self.output_hidden_states = config.output_hidden_states
-        self.return_dict = config.use_return_dict
+
         self.embeddings = TF{{cookiecutter.camelcase_modelname}}Embeddings(config, name="embeddings")
         self.encoder = TF{{cookiecutter.camelcase_modelname}}Encoder(config, name="encoder")
-        self.config = config
 
-    def get_input_embeddings(self):
+    # Copied from transformers.models.bert.modeling_tf_bert.TFBertMainLayer.get_input_embeddings
+    def get_input_embeddings(self) -> tf.keras.layers.Layer:
         return self.embeddings
 
-    def set_input_embeddings(self, value):
-        self.embeddings.word_embeddings = value
+    # Copied from transformers.models.bert.modeling_tf_bert.TFBertMainLayer.set_input_embeddings
+    def set_input_embeddings(self, value: tf.Variable):
+        self.embeddings.weight = value
         self.embeddings.vocab_size = shape_list(value)[0]
 
+    # Copied from transformers.models.bert.modeling_tf_bert.TFBertMainLayer._prune_heads
     def _prune_heads(self, heads_to_prune):
-        """Prunes heads of the model.
-        heads_to_prune: dict of {layer_num: list of heads to prune in this layer}
-        See base class PreTrainedModel
+        """
+        Prunes heads of the model. heads_to_prune: dict of {layer_num: list of heads to prune in this layer} See base
+        class PreTrainedModel
         """
         raise NotImplementedError
 
     def call(
         self,
-        input_ids=None,
-        attention_mask=None,
-        token_type_ids=None,
-        position_ids=None,
-        head_mask=None,
-        inputs_embeds=None,
-        output_attentions=None,
-        output_hidden_states=None,
-        return_dict=None,
-        training=False,
+        input_ids: Optional[TFModelInputType] = None,
+        attention_mask: Optional[Union[np.ndarray, tf.Tensor]] = None,
+        token_type_ids: Optional[Union[np.ndarray, tf.Tensor]] = None,
+        position_ids: Optional[Union[np.ndarray, tf.Tensor]] = None,
+        head_mask: Optional[Union[np.ndarray, tf.Tensor]] = None,
+        inputs_embeds: Optional[Union[np.ndarray, tf.Tensor]] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        training: bool = False,
         **kwargs,
-    ):
+    ) -> Union[TFBaseModelOutput, Tuple[tf.Tensor]]:
         inputs = input_processing(
             func=self.call,
             config=self.config,
@@ -542,7 +541,7 @@ class TF{{cookiecutter.camelcase_modelname}}MainLayer(tf.keras.layers.Layer):
             training=training,
             kwargs_call=kwargs,
         )
-        
+
         if inputs["input_ids"] is not None and inputs["inputs_embeds"] is not None:
             raise ValueError("You cannot specify both input_ids and inputs_embeds at the same time")
         elif inputs["input_ids"] is not None:
@@ -553,16 +552,16 @@ class TF{{cookiecutter.camelcase_modelname}}MainLayer(tf.keras.layers.Layer):
             raise ValueError("You have to specify either input_ids or inputs_embeds")
 
         if inputs["attention_mask"] is None:
-            inputs["attention_mask"] = tf.fill(input_shape, 1)
+            inputs["attention_mask"] = tf.fill(dims=input_shape, value=1)
 
         if inputs["token_type_ids"] is None:
-            inputs["token_type_ids"] = tf.fill(input_shape, 0)
+            inputs["token_type_ids"] = tf.fill(dims=input_shape, value=0)
 
         embedding_output = self.embeddings(
-            inputs["input_ids"],
-            inputs["position_ids"],
-            inputs["token_type_ids"],
-            inputs["inputs_embeds"],
+            input_ids=inputs["input_ids"],
+            position_ids=inputs["position_ids"],
+            token_type_ids=inputs["token_type_ids"],
+            inputs_embeds=inputs["inputs_embeds"],
             training=inputs["training"],
         )
 
@@ -571,15 +570,17 @@ class TF{{cookiecutter.camelcase_modelname}}MainLayer(tf.keras.layers.Layer):
         # So we can broadcast to [batch_size, num_heads, from_seq_length, to_seq_length]
         # this attention mask is more simple than the triangular masking of causal attention
         # used in OpenAI GPT, we just need to prepare the broadcast dimension here.
-        extended_attention_mask = inputs["attention_mask"][:, tf.newaxis, tf.newaxis, :]
+        extended_attention_mask = tf.reshape(inputs["attention_mask"], (input_shape[0], 1, 1, input_shape[1]))
 
         # Since attention_mask is 1.0 for positions we want to attend and 0.0 for
         # masked positions, this operation will create a tensor which is 0.0 for
         # positions we want to attend and -10000.0 for masked positions.
         # Since we are adding it to the raw scores before the softmax, this is
         # effectively the same as removing these entirely.
-        extended_attention_mask = tf.cast(extended_attention_mask, embedding_output.dtype)
-        extended_attention_mask = (1.0 - extended_attention_mask) * -10000.0
+        extended_attention_mask = tf.cast(extended_attention_mask, dtype=embedding_output.dtype)
+        one_cst = tf.constant(1.0, dtype=embedding_output.dtype)
+        ten_thousand_cst = tf.constant(-10000.0, dtype=embedding_output.dtype)
+        extended_attention_mask = tf.multiply(tf.subtract(one_cst, extended_attention_mask), ten_thousand_cst)
 
         # Prepare head mask if needed
         # 1.0 in head_mask indicate we keep the head
@@ -589,21 +590,21 @@ class TF{{cookiecutter.camelcase_modelname}}MainLayer(tf.keras.layers.Layer):
         if inputs["head_mask"] is not None:
             raise NotImplementedError
         else:
-            inputs["head_mask"] = [None] * self.num_hidden_layers
+            inputs["head_mask"] = [None] * self.config.num_hidden_layers
 
         encoder_outputs = self.encoder(
-            embedding_output,
-            extended_attention_mask,
-            inputs["head_mask"],
-            inputs["output_attentions"],
-            inputs["output_hidden_states"],
-            inputs["return_dict"],
+            hidden_states=embedding_output,
+            attention_mask=extended_attention_mask,
+            head_mask=inputs["head_mask"],
+            output_attentions=inputs["output_attentions"],
+            output_hidden_states=inputs["output_hidden_states"],
+            return_dict=inputs["return_dict"],
             training=inputs["training"],
         )
 
         sequence_output = encoder_outputs[0]
 
-        if not return_dict:
+        if not inputs["return_dict"]:
             return (
                 sequence_output,
             ) + encoder_outputs[1:]
@@ -622,7 +623,6 @@ class TF{{cookiecutter.camelcase_modelname}}PreTrainedModel(TFPreTrainedModel):
 
     config_class = {{cookiecutter.camelcase_modelname}}Config
     base_model_prefix = "{{cookiecutter.lowercase_modelname}}"
-
 
 
 {{cookiecutter.uppercase_modelname}}_START_DOCSTRING = r"""
@@ -662,54 +662,55 @@ class TF{{cookiecutter.camelcase_modelname}}PreTrainedModel(TFPreTrainedModel):
 
 {{cookiecutter.uppercase_modelname}}_INPUTS_DOCSTRING = r"""
     Args:
-        input_ids (:obj:`Numpy array` or :obj:`tf.Tensor` of shape :obj:`({0})`):
+        input_ids (:obj:`np.ndarray`, :obj:`tf.Tensor`, :obj:`List[tf.Tensor]` :obj:`Dict[str, tf.Tensor]` or :obj:`Dict[str, np.ndarray]` and each example must have the shape :obj:`({0})`):
             Indices of input sequence tokens in the vocabulary.
 
-            Indices can be obtained using :class:`~transformers.{{cookiecutter.camelcase_modelname}}Tokenizer`.
-            See :func:`transformers.PreTrainedTokenizer.__call__` and
-            :func:`transformers.PreTrainedTokenizer.encode` for details.
+            Indices can be obtained using :class:`~transformers.BertTokenizer`. See
+            :func:`transformers.PreTrainedTokenizer.__call__` and :func:`transformers.PreTrainedTokenizer.encode` for
+            details.
 
             `What are input IDs? <../glossary.html#input-ids>`__
-        attention_mask (:obj:`Numpy array` or :obj:`tf.Tensor` of shape :obj:`({0})`, `optional`):
-            Mask to avoid performing attention on padding token indices.
-            Mask values selected in ``[0, 1]``:
+        attention_mask (:obj:`np.ndarray` or :obj:`tf.Tensor` of shape :obj:`({0})`, `optional`):
+            Mask to avoid performing attention on padding token indices. Mask values selected in ``[0, 1]``:
 
             - 1 for tokens that are **not masked**,
-            - 0 for tokens that are **maked**.
+            - 0 for tokens that are **masked**.
 
             `What are attention masks? <../glossary.html#attention-mask>`__
-        token_type_ids (:obj:`Numpy array` or :obj:`tf.Tensor` of shape :obj:`({0})`, `optional`):
-            Segment token indices to indicate first and second portions of the inputs.
-            Indices are selected in ``[0, 1]``:
+        token_type_ids (:obj:`np.ndarray` or :obj:`tf.Tensor` of shape :obj:`({0})`, `optional`):
+            Segment token indices to indicate first and second portions of the inputs. Indices are selected in ``[0,
+            1]``:
 
             - 0 corresponds to a `sentence A` token,
             - 1 corresponds to a `sentence B` token.
 
             `What are token type IDs? <../glossary.html#token-type-ids>`__
-        position_ids (:obj:`Numpy array` or :obj:`tf.Tensor` of shape :obj:`({0})`, `optional`):
-            Indices of positions of each input sequence tokens in the position embeddings.
-            Selected in the range ``[0, config.max_position_embeddings - 1]``.
+        position_ids (:obj:`np.ndarray` or :obj:`tf.Tensor` of shape :obj:`({0})`, `optional`):
+            Indices of positions of each input sequence tokens in the position embeddings. Selected in the range ``[0,
+            config.max_position_embeddings - 1]``.
 
             `What are position IDs? <../glossary.html#position-ids>`__
-        head_mask (:obj:`Numpy array` or :obj:`tf.Tensor` of shape :obj:`(num_heads,)` or :obj:`(num_layers, num_heads)`, `optional`):
-            Mask to nullify selected heads of the self-attention modules.
-            Mask values selected in ``[0, 1]``:
+        head_mask (:obj:`np.ndarray` or :obj:`tf.Tensor` of shape :obj:`(num_heads,)` or :obj:`(num_layers, num_heads)`, `optional`):
+            Mask to nullify selected heads of the self-attention modules. Mask values selected in ``[0, 1]``:
 
             - 1 indicates the head is **not masked**,
             - 0 indicates the head is **masked**.
 
-        inputs_embeds (:obj:`tf.Tensor` of shape :obj:`({0}, hidden_size)`, `optional`):
+        inputs_embeds (:obj:`np.ndarray` or :obj:`tf.Tensor` of shape :obj:`({0}, hidden_size)`, `optional`):
             Optionally, instead of passing :obj:`input_ids` you can choose to directly pass an embedded representation.
             This is useful if you want more control over how to convert :obj:`input_ids` indices into associated
             vectors than the model's internal embedding lookup matrix.
         output_attentions (:obj:`bool`, `optional`):
             Whether or not to return the attentions tensors of all attention layers. See ``attentions`` under returned
-            tensors for more detail.
+            tensors for more detail. This argument can be used only in eager mode, in graph mode the value in the
+            config will be used instead.
         output_hidden_states (:obj:`bool`, `optional`):
             Whether or not to return the hidden states of all layers. See ``hidden_states`` under returned tensors for
-            more detail.
+            more detail. This argument can be used only in eager mode, in graph mode the value in the config will be
+            used instead.
         return_dict (:obj:`bool`, `optional`):
-            Whether or not to return a :class:`~transformers.file_utils.ModelOutput` instead of a plain tuple.
+            Whether or not to return a :class:`~transformers.file_utils.ModelOutput` instead of a plain tuple. This
+            argument can be used in eager mode, in graph mode the value will always be set to True.
         training (:obj:`bool`, `optional`, defaults to :obj:`False`):
             Whether or not to use the model in training mode (some modules like dropout modules have different
             behaviors between training and evaluation).
@@ -721,7 +722,7 @@ class TF{{cookiecutter.camelcase_modelname}}PreTrainedModel(TFPreTrainedModel):
     {{cookiecutter.uppercase_modelname}}_START_DOCSTRING,
 )
 class TF{{cookiecutter.camelcase_modelname}}Model(TF{{cookiecutter.camelcase_modelname}}PreTrainedModel):
-    def __init__(self, config, *inputs, **kwargs):
+    def __init__(self, config: {{cookiecutter.camelcase_modelname}}Config, *inputs, **kwargs):
         super().__init__(config, *inputs, **kwargs)
 
         self.{{cookiecutter.lowercase_modelname}} = TF{{cookiecutter.camelcase_modelname}}MainLayer(config, name="{{cookiecutter.lowercase_modelname}}")
@@ -729,24 +730,24 @@ class TF{{cookiecutter.camelcase_modelname}}Model(TF{{cookiecutter.camelcase_mod
     @add_start_docstrings_to_model_forward({{cookiecutter.uppercase_modelname}}_INPUTS_DOCSTRING.format("batch_size, sequence_length"))
     @add_code_sample_docstrings(
         tokenizer_class=_TOKENIZER_FOR_DOC,
-        checkpoint="{{cookiecutter.checkpoint_identifier}}",
+        checkpoint=_CHECKPOINT_FOR_DOC,
         output_type=TFBaseModelOutputWithPooling,
         config_class=_CONFIG_FOR_DOC,
     )
     def call(
         self,
-        input_ids=None,
-        attention_mask=None,
-        token_type_ids=None,
-        position_ids=None,
-        head_mask=None,
-        inputs_embeds=None,
-        output_attentions=None,
-        output_hidden_states=None,
-        return_dict=None,
-        training=False,
+        input_ids: Optional[TFModelInputType] = None,
+        attention_mask: Optional[Union[np.ndarray, tf.Tensor]] = None,
+        token_type_ids: Optional[Union[np.ndarray, tf.Tensor]] = None,
+        position_ids: Optional[Union[np.ndarray, tf.Tensor]] = None,
+        head_mask: Optional[Union[np.ndarray, tf.Tensor]] = None,
+        inputs_embeds: Optional[Union[np.ndarray, tf.Tensor]] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        training: Optional[bool] = False,
         **kwargs,
-    ):
+    ) -> Union[TFBaseModelOutputWithPooling, Tuple[tf.Tensor]]:
         inputs = input_processing(
             func=self.call,
             config=self.config,
@@ -777,11 +778,18 @@ class TF{{cookiecutter.camelcase_modelname}}Model(TF{{cookiecutter.camelcase_mod
 
         return outputs
 
+    # Copied from transformers.models.distilbert.modeling_tf_distilbert.TFDistilBertModel.serving_output
+    def serving_output(self, output: TFBaseModelOutput) -> TFBaseModelOutput:
+        hs = tf.convert_to_tensor(output.hidden_states) if self.config.output_hidden_states else None
+        attns = tf.convert_to_tensor(output.attentions) if self.config.output_attentions else None
+
+        return TFBaseModelOutput(last_hidden_state=output.last_hidden_state, hidden_states=hs, attentions=attns)
+
 
 @add_start_docstrings("""{{cookiecutter.modelname}} Model with a `language modeling` head on top. """, {{cookiecutter.uppercase_modelname}}_START_DOCSTRING)
 class TF{{cookiecutter.camelcase_modelname}}ForMaskedLM(TF{{cookiecutter.camelcase_modelname}}PreTrainedModel, TFMaskedLanguageModelingLoss):
 
-    def __init__(self, config, *inputs, **kwargs):
+    def __init__(self, config: {{cookiecutter.camelcase_modelname}}Config, *inputs, **kwargs):
         super().__init__(config, *inputs, **kwargs)
 
         if config.is_decoder:
@@ -791,45 +799,38 @@ class TF{{cookiecutter.camelcase_modelname}}ForMaskedLM(TF{{cookiecutter.camelca
             )
 
         self.{{cookiecutter.lowercase_modelname}} = TF{{cookiecutter.camelcase_modelname}}MainLayer(config, name="{{cookiecutter.lowercase_modelname}}")
-        self.mlm = TF{{cookiecutter.camelcase_modelname}}MLMHead(config, self.{{cookiecutter.lowercase_modelname}}.embeddings, name="mlm___cls")
-    
-    def get_output_embeddings(self):
-        return self.{{cookiecutter.lowercase_modelname}}.embeddings
+        self.mlm = TF{{cookiecutter.camelcase_modelname}}MLMHead(config, input_embeddings=self.{{cookiecutter.lowercase_modelname}}.embeddings, name="mlm___cls")
 
-    def get_output_layer_with_bias(self):
+    def get_lm_head(self) -> tf.keras.layers.Layer:
         return self.mlm.predictions
-
-    def get_prefix_bias_name(self):
-        return self.name + "/" + self.mlm.name + "/" + self.mlm.predictions.name
 
     @add_start_docstrings_to_model_forward({{cookiecutter.uppercase_modelname}}_INPUTS_DOCSTRING.format("batch_size, sequence_length"))
     @add_code_sample_docstrings(
         tokenizer_class=_TOKENIZER_FOR_DOC,
-        checkpoint="{{cookiecutter.checkpoint_identifier}}",
+        checkpoint=_CHECKPOINT_FOR_DOC,
         output_type=TFMaskedLMOutput,
         config_class=_CONFIG_FOR_DOC,
     )
     def call(
         self,
-        input_ids=None,
-        attention_mask=None,
-        token_type_ids=None,
-        position_ids=None,
-        head_mask=None,
-        inputs_embeds=None,
-        output_attentions=None,
-        output_hidden_states=None,
-        return_dict=None,
-        labels=None,
-        training=False,
+        input_ids: Optional[TFModelInputType] = None,
+        attention_mask: Optional[Union[np.ndarray, tf.Tensor]] = None,
+        token_type_ids: Optional[Union[np.ndarray, tf.Tensor]] = None,
+        position_ids: Optional[Union[np.ndarray, tf.Tensor]] = None,
+        head_mask: Optional[Union[np.ndarray, tf.Tensor]] = None,
+        inputs_embeds: Optional[Union[np.ndarray, tf.Tensor]] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        labels: Optional[Union[np.ndarray, tf.Tensor]] = None,
+        training: Optional[bool] = False,
         **kwargs,
-    ):
+    ) -> Union[TFMaskedLMOutput, Tuple[tf.Tensor]]:
         r"""
-        labels (:obj:`tf.Tensor` of shape :obj:`(batch_size, sequence_length)`, `optional`):
-            Labels for computing the masked language modeling loss.
-            Indices should be in ``[-100, 0, ..., config.vocab_size]`` (see ``input_ids`` docstring)
-            Tokens with indices set to ``-100`` are ignored (masked), the loss is only computed for the tokens with labels
-            in ``[0, ..., config.vocab_size]``
+        labels (:obj:`tf.Tensor` or :obj:`np.ndarray` of shape :obj:`(batch_size, sequence_length)`, `optional`):
+            Labels for computing the masked language modeling loss. Indices should be in ``[-100, 0, ...,
+            config.vocab_size]`` (see ``input_ids`` docstring) Tokens with indices set to ``-100`` are ignored
+            (masked), the loss is only computed for the tokens with labels in ``[0, ..., config.vocab_size]``
         """
         inputs = input_processing(
             func=self.call,
@@ -848,7 +849,7 @@ class TF{{cookiecutter.camelcase_modelname}}ForMaskedLM(TF{{cookiecutter.camelca
             kwargs_call=kwargs,
         )
         outputs = self.{{cookiecutter.lowercase_modelname}}(
-            inputs["input_ids"],
+            input_ids=inputs["input_ids"],
             attention_mask=inputs["attention_mask"],
             token_type_ids=inputs["token_type_ids"],
             position_ids=inputs["position_ids"],
@@ -859,13 +860,14 @@ class TF{{cookiecutter.camelcase_modelname}}ForMaskedLM(TF{{cookiecutter.camelca
             return_dict=inputs["return_dict"],
             training=inputs["training"],
         )
-
         sequence_output = outputs[0]
-        prediction_scores = self.mlm(sequence_output, training=inputs["training"])
-        loss = None if inputs["labels"] is None else self.compute_loss(inputs["labels"], prediction_scores)
+        prediction_scores = self.mlm(sequence_output=sequence_output, training=inputs["training"])
+        loss = (
+            None if inputs["labels"] is None else self.compute_loss(labels=inputs["labels"], logits=prediction_scores)
+        )
 
         if not inputs["return_dict"]:
-            output = (prediction_scores,) + outputs[1:]
+            output = (prediction_scores,) + outputs[2:]
             return ((loss,) + output) if loss is not None else output
 
         return TFMaskedLMOutput(
@@ -875,52 +877,54 @@ class TF{{cookiecutter.camelcase_modelname}}ForMaskedLM(TF{{cookiecutter.camelca
             attentions=outputs.attentions,
         )
 
+    # Copied from transformers.models.bert.modeling_tf_bert.TFBertForMaskedLM.serving_output
+    def serving_output(self, output: TFMaskedLMOutput) -> TFMaskedLMOutput:
+        hs = tf.convert_to_tensor(output.hidden_states) if self.config.output_hidden_states else None
+        attns = tf.convert_to_tensor(output.attentions) if self.config.output_attentions else None
+
+        return TFMaskedLMOutput(logits=output.logits, hidden_states=hs, attentions=attns)
+
+
 @add_start_docstrings(
     """{{cookiecutter.modelname}} Model with a `language modeling` head on top for CLM fine-tuning. """, {{cookiecutter.uppercase_modelname}}_START_DOCSTRING
 )
 class TF{{cookiecutter.camelcase_modelname}}ForCausalLM(TF{{cookiecutter.camelcase_modelname}}PreTrainedModel, TFCausalLanguageModelingLoss):
 
-    def __init__(self, config, *inputs, **kwargs):
+    def __init__(self, config: {{cookiecutter.camelcase_modelname}}Config, *inputs, **kwargs):
         super().__init__(config, *inputs, **kwargs)
 
         if not config.is_decoder:
             logger.warning("If you want to use `TF{{cookiecutter.camelcase_modelname}}ForCausalLM` as a standalone, add `is_decoder=True.`")
 
         self.{{cookiecutter.lowercase_modelname}} = TF{{cookiecutter.camelcase_modelname}}MainLayer(config, name="{{cookiecutter.lowercase_modelname}}")
-        self.mlm = TF{{cookiecutter.camelcase_modelname}}MLMHead(config, self.{{cookiecutter.lowercase_modelname}}.embeddings, name="mlm___cls")
+        self.mlm = TF{{cookiecutter.camelcase_modelname}}MLMHead(config, input_embeddings=self.{{cookiecutter.lowercase_modelname}}.embeddings, name="mlm___cls")
 
-    def get_output_embeddings(self):
-        return self.{{cookiecutter.lowercase_modelname}}.embeddings
-
-    def get_output_layer_with_bias(self):
+    def get_lm_head(self) -> tf.keras.layers.Layer:
         return self.mlm.predictions
-
-    def get_prefix_bias_name(self):
-        return self.name + "/" + self.mlm.name + "/" + self.mlm.predictions.name
 
     @add_code_sample_docstrings(
         tokenizer_class=_TOKENIZER_FOR_DOC,
-        checkpoint="{{cookiecutter.checkpoint_identifier}}",
+        checkpoint=_CHECKPOINT_FOR_DOC,
         output_type=TFCausalLMOutput,
         config_class=_CONFIG_FOR_DOC,
     )
     def call(
         self,
-        input_ids=None,
-        attention_mask=None,
-        token_type_ids=None,
-        position_ids=None,
-        head_mask=None,
-        inputs_embeds=None,
-        output_attentions=None,
-        output_hidden_states=None,
-        return_dict=None,
-        labels=None,
-        training=False,
+        input_ids: Optional[TFModelInputType] = None,
+        attention_mask: Optional[Union[np.ndarray, tf.Tensor]] = None,
+        token_type_ids: Optional[Union[np.ndarray, tf.Tensor]] = None,
+        position_ids: Optional[Union[np.ndarray, tf.Tensor]] = None,
+        head_mask: Optional[Union[np.ndarray, tf.Tensor]] = None,
+        inputs_embeds: Optional[Union[np.ndarray, tf.Tensor]] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        labels: Optional[Union[np.ndarray, tf.Tensor]] = None,
+        training: Optional[bool] = False,
         **kwargs,
-    ):
+    ) -> Union[TFCausalLMOutput, Tuple[tf.Tensor]]:
         r"""
-        labels (:obj:`tf.Tensor` of shape :obj:`(batch_size, sequence_length)`, `optional`):
+        labels (:obj:`tf.Tensor` or :obj:`np.ndarray` of shape :obj:`(batch_size, sequence_length)`, `optional`):
             Labels for computing the cross entropy classification loss. Indices should be in ``[0, ...,
             config.vocab_size - 1]``.
         """
@@ -941,7 +945,7 @@ class TF{{cookiecutter.camelcase_modelname}}ForCausalLM(TF{{cookiecutter.camelca
             kwargs_call=kwargs,
         )
         outputs = self.{{cookiecutter.lowercase_modelname}}(
-            inputs["input_ids"],
+            input_ids=inputs["input_ids"],
             attention_mask=inputs["attention_mask"],
             token_type_ids=inputs["token_type_ids"],
             position_ids=inputs["position_ids"],
@@ -953,17 +957,17 @@ class TF{{cookiecutter.camelcase_modelname}}ForCausalLM(TF{{cookiecutter.camelca
             training=inputs["training"],
         )
         sequence_output = outputs[0]
-        logits = self.mlm(sequence_output, training=inputs["training"])
+        logits = self.mlm(sequence_output=sequence_output, training=inputs["training"])
         loss = None
 
         if inputs["labels"] is not None:
             # shift labels to the left and cut last logit token
             logits = logits[:, :-1]
             labels = inputs["labels"][:, 1:]
-            loss = self.compute_loss(labels, logits)
+            loss = self.compute_loss(labels=labels, logits=logits)
 
         if not inputs["return_dict"]:
-            output = (logits,) + outputs[1:]
+            output = (logits,) + outputs[2:]
             return ((loss,) + output) if loss is not None else output
 
         return TFCausalLMOutput(
@@ -973,72 +977,84 @@ class TF{{cookiecutter.camelcase_modelname}}ForCausalLM(TF{{cookiecutter.camelca
             attentions=outputs.attentions,
         )
 
+    # Copied from transformers.models.bert.modeling_tf_bert.TFBertLMHeadModel.serving_output
+    def serving_output(self, output: TFCausalLMOutput) -> TFCausalLMOutput:
+        hs = tf.convert_to_tensor(output.hidden_states) if self.config.output_hidden_states else None
+        attns = tf.convert_to_tensor(output.attentions) if self.config.output_attentions else None
+
+        return TFCausalLMOutput(logits=output.logits, hidden_states=hs, attentions=attns)
+
+
 class TF{{cookiecutter.camelcase_modelname}}ClassificationHead(tf.keras.layers.Layer):
     """Head for sentence-level classification tasks."""
 
-    def __init__(self, config, **kwargs):
-        super().__init__(**kwargs)
+    def __init__(self, config: {{cookiecutter.camelcase_modelname}}Config, *inputs, **kwargs):
+        super().__init__(config, *inputs, **kwargs)
 
         self.dense = tf.keras.layers.Dense(
-            config.hidden_size, kernel_initializer=get_initializer(config.initializer_range), name="dense"
+            units=config.hidden_size, kernel_initializer=get_initializer(config.initializer_range), name="dense"
         )
-        self.dropout = tf.keras.layers.Dropout(config.hidden_dropout_prob)
+        self.dropout = tf.keras.layers.Dropout(rate=config.hidden_dropout_prob)
         self.out_proj = tf.keras.layers.Dense(
-            config.num_labels, kernel_initializer=get_initializer(config.initializer_range), name="out_proj"
+            units=config.num_labels, kernel_initializer=get_initializer(config.initializer_range), name="out_proj"
         )
 
-        self.config = config
+        if isinstance(config.hidden_act, str):
+            self.classifier_act_fn = get_tf_activation(config.hidden_act)
+        else:
+            self.classifier_act_fn = config.hidden_act
 
-    def call(self, inputs, **kwargs):
-        x = inputs[:, 0, :]  # take <s> token (equiv. to [CLS])
-        x = self.dropout(x)
-        x = self.dense(x)
-        x = get_tf_activation(self.config.hidden_act)(x)
-        x = self.dropout(x)
-        x = self.out_proj(x)
+    def call(self, hidden_states: tf.Tensor, training: bool = False) -> tf.Tensor:
+        hidden_states = hidden_states[:, 0, :]  # take <s> token (equiv. to [CLS])
+        hidden_states = self.dropout(inputs=hidden_states, training=training)
+        hidden_states = self.dense(inputs=hidden_states)
+        hidden_states = self.classifier_act_fn(hidden_states)
+        hidden_states = self.dropout(inputs=hidden_states, training=training)
+        hidden_states = self.out_proj(hidden_states)
 
-        return x
+        return hidden_states
 
 
 @add_start_docstrings(
-    """{{cookiecutter.modelname}} Model transformer with a sequence classification/regression head on top 
+    """{{cookiecutter.modelname}} Model transformer with a sequence classification/regression head on top
     e.g., for GLUE tasks. """,
     {{cookiecutter.uppercase_modelname}}_START_DOCSTRING,
 )
 class TF{{cookiecutter.camelcase_modelname}}ForSequenceClassification(TF{{cookiecutter.camelcase_modelname}}PreTrainedModel, TFSequenceClassificationLoss):
-    def __init__(self, config, *inputs, **kwargs):
+    def __init__(self, config: {{cookiecutter.camelcase_modelname}}Config, *inputs, **kwargs):
         super().__init__(config, *inputs, **kwargs)
+
         self.num_labels = config.num_labels
+
         self.{{cookiecutter.lowercase_modelname}} = TF{{cookiecutter.camelcase_modelname}}MainLayer(config, name="{{cookiecutter.lowercase_modelname}}")
         self.classifier = TF{{cookiecutter.camelcase_modelname}}ClassificationHead(config, name="classifier")
 
     @add_start_docstrings_to_model_forward({{cookiecutter.uppercase_modelname}}_INPUTS_DOCSTRING.format("batch_size, sequence_length"))
     @add_code_sample_docstrings(
         tokenizer_class=_TOKENIZER_FOR_DOC,
-        checkpoint="{{cookiecutter.checkpoint_identifier}}",
+        checkpoint=_CHECKPOINT_FOR_DOC,
         output_type=TFSequenceClassifierOutput,
         config_class=_CONFIG_FOR_DOC,
     )
     def call(
         self,
-        input_ids=None,
-        attention_mask=None,
-        token_type_ids=None,
-        position_ids=None,
-        head_mask=None,
-        inputs_embeds=None,
-        output_attentions=None,
-        output_hidden_states=None,
-        return_dict=None,
-        labels=None,
-        training=False,
+        input_ids: Optional[TFModelInputType] = None,
+        attention_mask: Optional[Union[np.ndarray, tf.Tensor]] = None,
+        token_type_ids: Optional[Union[np.ndarray, tf.Tensor]] = None,
+        position_ids: Optional[Union[np.ndarray, tf.Tensor]] = None,
+        head_mask: Optional[Union[np.ndarray, tf.Tensor]] = None,
+        inputs_embeds: Optional[Union[np.ndarray, tf.Tensor]] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        labels: Optional[Union[np.ndarray, tf.Tensor]] = None,
+        training: Optional[bool] = False,
         **kwargs,
-    ):
+    ) -> Union[TFSequenceClassifierOutput, Tuple[tf.Tensor]]:
         r"""
-        labels (:obj:`tf.Tensor` of shape :obj:`(batch_size,)`, `optional`):
-            Labels for computing the sequence classification/regression loss.
-            Indices should be in :obj:`[0, ..., config.num_labels - 1]`.
-            If :obj:`config.num_labels == 1` a regression loss is computed (Mean-Square loss),
+        labels (:obj:`tf.Tensor` or :obj:`np.ndarray` of shape :obj:`(batch_size,)`, `optional`):
+            Labels for computing the sequence classification/regression loss. Indices should be in :obj:`[0, ...,
+            config.num_labels - 1]`. If :obj:`config.num_labels == 1` a regression loss is computed (Mean-Square loss),
             If :obj:`config.num_labels > 1` a classification loss is computed (Cross-Entropy).
         """
         inputs = input_processing(
@@ -1058,7 +1074,7 @@ class TF{{cookiecutter.camelcase_modelname}}ForSequenceClassification(TF{{cookie
             kwargs_call=kwargs,
         )
         outputs = self.{{cookiecutter.lowercase_modelname}}(
-            inputs["input_ids"],
+            input_ids=inputs["input_ids"],
             attention_mask=inputs["attention_mask"],
             token_type_ids=inputs["token_type_ids"],
             position_ids=inputs["position_ids"],
@@ -1069,8 +1085,8 @@ class TF{{cookiecutter.camelcase_modelname}}ForSequenceClassification(TF{{cookie
             return_dict=inputs["return_dict"],
             training=inputs["training"],
         )
-        logits = self.classifier(outputs[0], training=inputs["training"])
-        loss = None if inputs["labels"] is None else self.compute_loss(inputs["labels"], logits)
+        logits = self.classifier(hidden_states=outputs[0], training=inputs["training"])
+        loss = None if inputs["labels"] is None else self.compute_loss(labels=inputs["labels"], logits=logits)
 
         if not inputs["return_dict"]:
             output = (logits,) + outputs[1:]
@@ -1084,6 +1100,13 @@ class TF{{cookiecutter.camelcase_modelname}}ForSequenceClassification(TF{{cookie
             attentions=outputs.attentions,
         )
 
+    # Copied from transformers.models.bert.modeling_tf_bert.TFBertForSequenceClassification.serving_output
+    def serving_output(self, output: TFSequenceClassifierOutput) -> TFSequenceClassifierOutput:
+        hs = tf.convert_to_tensor(output.hidden_states) if self.config.output_hidden_states else None
+        attns = tf.convert_to_tensor(output.attentions) if self.config.output_attentions else None
+
+        return TFSequenceClassifierOutput(logits=output.logits, hidden_states=hs, attentions=attns)
+
 
 @add_start_docstrings(
     """{{cookiecutter.modelname}} Model with a multiple choice classification head on top (a linear layer on top of
@@ -1091,54 +1114,54 @@ class TF{{cookiecutter.camelcase_modelname}}ForSequenceClassification(TF{{cookie
     {{cookiecutter.uppercase_modelname}}_START_DOCSTRING,
 )
 class TF{{cookiecutter.camelcase_modelname}}ForMultipleChoice(TF{{cookiecutter.camelcase_modelname}}PreTrainedModel, TFMultipleChoiceLoss):
-    def __init__(self, config, *inputs, **kwargs):
+    def __init__(self, config: {{cookiecutter.camelcase_modelname}}Config, *inputs, **kwargs):
         super().__init__(config, *inputs, **kwargs)
 
         self.{{cookiecutter.lowercase_modelname}} = TF{{cookiecutter.camelcase_modelname}}MainLayer(config, name="{{cookiecutter.lowercase_modelname}}")
         self.sequence_summary = TFSequenceSummary(
-            config, initializer_range=config.initializer_range, name="sequence_summary"
+            config, config.initializer_range, name="sequence_summary"
         )
         self.classifier = tf.keras.layers.Dense(
-            1, kernel_initializer=get_initializer(config.initializer_range), name="classifier"
+            units=1, kernel_initializer=get_initializer(config.initializer_range), name="classifier"
         )
 
     @property
-    def dummy_inputs(self):
+    def dummy_inputs(self) -> Dict[str, tf.Tensor]:
         """
         Dummy inputs to build the network.
 
         Returns:
             tf.Tensor with dummy inputs
         """
-        return {"input_ids": tf.convert_to_tensor(MULTIPLE_CHOICE_DUMMY_INPUTS)}
+        return {"input_ids": tf.constant(MULTIPLE_CHOICE_DUMMY_INPUTS)}
 
     @add_start_docstrings_to_model_forward({{cookiecutter.uppercase_modelname}}_INPUTS_DOCSTRING.format("batch_size, num_choices, sequence_length"))
     @add_code_sample_docstrings(
         tokenizer_class=_TOKENIZER_FOR_DOC,
-        checkpoint="{{cookiecutter.checkpoint_identifier}}",
+        checkpoint=_CHECKPOINT_FOR_DOC,
         output_type=TFMultipleChoiceModelOutput,
         config_class=_CONFIG_FOR_DOC,
     )
     def call(
         self,
-        input_ids=None,
-        attention_mask=None,
-        token_type_ids=None,
-        position_ids=None,
-        head_mask=None,
-        inputs_embeds=None,
-        output_attentions=None,
-        output_hidden_states=None,
-        return_dict=None,
-        labels=None,
-        training=False,
+        input_ids: Optional[TFModelInputType] = None,
+        attention_mask: Optional[Union[np.ndarray, tf.Tensor]] = None,
+        token_type_ids: Optional[Union[np.ndarray, tf.Tensor]] = None,
+        position_ids: Optional[Union[np.ndarray, tf.Tensor]] = None,
+        head_mask: Optional[Union[np.ndarray, tf.Tensor]] = None,
+        inputs_embeds: Optional[Union[np.ndarray, tf.Tensor]] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        labels: Optional[Union[np.ndarray, tf.Tensor]] = None,
+        training: Optional[bool] = False,
         **kwargs,
-    ):
+    ) -> Union[TFMultipleChoiceModelOutput, Tuple[tf.Tensor]]:
         r"""
-        labels (:obj:`tf.Tensor` of shape :obj:`(batch_size,)`, `optional`):
-            Labels for computing the multiple choice classification loss.
-            Indices should be in ``[0, ..., num_choices]`` where :obj:`num_choices` is the size of the second dimension
-            of the input tensors. (See :obj:`input_ids` above)
+        labels (:obj:`tf.Tensor` or :obj:`np.ndarray` of shape :obj:`(batch_size,)`, `optional`):
+            Labels for computing the multiple choice classification loss. Indices should be in ``[0, ...,
+            num_choices]`` where :obj:`num_choices` is the size of the second dimension of the input tensors. (See
+            :obj:`input_ids` above)
         """
         inputs = input_processing(
             func=self.call,
@@ -1156,7 +1179,7 @@ class TF{{cookiecutter.camelcase_modelname}}ForMultipleChoice(TF{{cookiecutter.c
             training=training,
             kwargs_call=kwargs,
         )
-        
+
         if inputs["input_ids"] is not None:
             num_choices = shape_list(inputs["input_ids"])[1]
             seq_length = shape_list(inputs["input_ids"])[2]
@@ -1164,37 +1187,47 @@ class TF{{cookiecutter.camelcase_modelname}}ForMultipleChoice(TF{{cookiecutter.c
             num_choices = shape_list(inputs["inputs_embeds"])[1]
             seq_length = shape_list(inputs["inputs_embeds"])[2]
 
-        flat_input_ids = tf.reshape(inputs["input_ids"], (-1, seq_length)) if inputs["input_ids"] is not None else None
+        flat_input_ids = (
+            tf.reshape(tensor=inputs["input_ids"], shape=(-1, seq_length)) if inputs["input_ids"] is not None else None
+        )
         flat_attention_mask = (
-            tf.reshape(inputs["attention_mask"], (-1, seq_length)) if inputs["attention_mask"] is not None else None
+            tf.reshape(tensor=inputs["attention_mask"], shape=(-1, seq_length))
+            if inputs["attention_mask"] is not None
+            else None
         )
         flat_token_type_ids = (
-            tf.reshape(inputs["token_type_ids"], (-1, seq_length)) if inputs["token_type_ids"] is not None else None
+            tf.reshape(tensor=inputs["token_type_ids"], shape=(-1, seq_length))
+            if inputs["token_type_ids"] is not None
+            else None
         )
         flat_position_ids = (
-            tf.reshape(inputs["position_ids"], (-1, seq_length)) if inputs["position_ids"] is not None else None
+            tf.reshape(tensor=inputs["position_ids"], shape=(-1, seq_length))
+            if inputs["position_ids"] is not None
+            else None
         )
         flat_inputs_embeds = (
-            tf.reshape(inputs["inputs_embeds"], (-1, seq_length, shape_list(inputs["inputs_embeds"])[3]))
+            tf.reshape(
+                tensor=inputs["inputs_embeds"], shape=(-1, seq_length, shape_list(inputs["inputs_embeds"])[3])
+            )
             if inputs["inputs_embeds"] is not None
             else None
         )
         outputs = self.{{cookiecutter.lowercase_modelname}}(
-            flat_input_ids,
-            flat_attention_mask,
-            flat_token_type_ids,
-            flat_position_ids,
-            inputs["head_mask"],
-            flat_inputs_embeds,
-            inputs["output_attentions"],
-            inputs["output_hidden_states"],
+            input_ids=flat_input_ids,
+            attention_mask=flat_attention_mask,
+            token_type_ids=flat_token_type_ids,
+            position_ids=flat_position_ids,
+            head_mask=inputs["head_mask"],
+            inputs_embeds=flat_inputs_embeds,
+            output_attentions=inputs["output_attentions"],
+            output_hidden_states=inputs["output_hidden_states"],
             return_dict=inputs["return_dict"],
             training=inputs["training"],
         )
-        logits = self.sequence_summary(outputs[0], training=inputs["training"])
-        logits = self.classifier(logits)
-        reshaped_logits = tf.reshape(logits, (-1, num_choices))
-        loss = None if inputs["labels"] is None else self.compute_loss(inputs["labels"], reshaped_logits)
+        logits = self.sequence_summary(inputs=outputs[0], training=inputs["training"])
+        logits = self.classifier(inputs=logits)
+        reshaped_logits = tf.reshape(tensor=logits, shape=(-1, num_choices))
+        loss = None if inputs["labels"] is None else self.compute_loss(labels=inputs["labels"], logits=reshaped_logits)
 
         if not inputs["return_dict"]:
             output = (reshaped_logits,) + outputs[1:]
@@ -1208,6 +1241,25 @@ class TF{{cookiecutter.camelcase_modelname}}ForMultipleChoice(TF{{cookiecutter.c
             attentions=outputs.attentions,
         )
 
+    @tf.function(input_signature=[{
+        "input_ids": tf.TensorSpec((None, None, None), tf.int32, name="input_ids"),
+        "attention_mask": tf.TensorSpec((None, None, None), tf.int32, name="attention_mask"),
+        "token_type_ids": tf.TensorSpec((None, None, None), tf.int32, name="token_type_ids"),
+    }])
+    # Copied from transformers.models.bert.modeling_tf_bert.TFBertForMultipleChoice.serving
+    def serving(self, inputs: Dict[str, tf.Tensor]) -> TFMultipleChoiceModelOutput:
+        output = self.call(input_ids=inputs)
+
+        return self.serving_output(output)
+
+    # Copied from transformers.models.bert.modeling_tf_bert.TFBertForMultipleChoice.serving_output
+    def serving_output(self, output: TFMultipleChoiceModelOutput) -> TFMultipleChoiceModelOutput:
+        hs = tf.convert_to_tensor(output.hidden_states) if self.config.output_hidden_states else None
+        attns = tf.convert_to_tensor(output.attentions) if self.config.output_attentions else None
+
+        return TFMultipleChoiceModelOutput(logits=output.logits, hidden_states=hs, attentions=attns)
+
+
 @add_start_docstrings(
     """{{cookiecutter.modelname}} Model with a token classification head on top (a linear layer on top of
     the hidden-states output) e.g. for Named-Entity-Recognition (NER) tasks. """,
@@ -1215,42 +1267,43 @@ class TF{{cookiecutter.camelcase_modelname}}ForMultipleChoice(TF{{cookiecutter.c
 )
 class TF{{cookiecutter.camelcase_modelname}}ForTokenClassification(TF{{cookiecutter.camelcase_modelname}}PreTrainedModel, TFTokenClassificationLoss):
 
-    def __init__(self, config, *inputs, **kwargs):
+    def __init__(self, config: {{cookiecutter.camelcase_modelname}}Config, *inputs, **kwargs):
         super().__init__(config, *inputs, **kwargs)
 
         self.num_labels = config.num_labels
+
         self.{{cookiecutter.lowercase_modelname}} = TF{{cookiecutter.camelcase_modelname}}MainLayer(config, name="{{cookiecutter.lowercase_modelname}}")
-        self.dropout = tf.keras.layers.Dropout(config.hidden_dropout_prob)
+        self.dropout = tf.keras.layers.Dropout(rate=config.hidden_dropout_prob)
         self.classifier = tf.keras.layers.Dense(
-            config.num_labels, kernel_initializer=get_initializer(config.initializer_range), name="classifier"
+            units=config.num_labels, kernel_initializer=get_initializer(config.initializer_range), name="classifier"
         )
 
     @add_start_docstrings_to_model_forward({{cookiecutter.uppercase_modelname}}_INPUTS_DOCSTRING.format("batch_size, sequence_length"))
     @add_code_sample_docstrings(
         tokenizer_class=_TOKENIZER_FOR_DOC,
-        checkpoint="{{cookiecutter.checkpoint_identifier}}",
+        checkpoint=_CHECKPOINT_FOR_DOC,
         output_type=TFTokenClassifierOutput,
         config_class=_CONFIG_FOR_DOC,
     )
     def call(
         self,
-        input_ids=None,
-        attention_mask=None,
-        token_type_ids=None,
-        position_ids=None,
-        head_mask=None,
-        inputs_embeds=None,
-        output_attentions=None,
-        output_hidden_states=None,
-        return_dict=None,
-        labels=None,
-        training=False,
+        input_ids: Optional[TFModelInputType] = None,
+        attention_mask: Optional[Union[np.ndarray, tf.Tensor]] = None,
+        token_type_ids: Optional[Union[np.ndarray, tf.Tensor]] = None,
+        position_ids: Optional[Union[np.ndarray, tf.Tensor]] = None,
+        head_mask: Optional[Union[np.ndarray, tf.Tensor]] = None,
+        inputs_embeds: Optional[Union[np.ndarray, tf.Tensor]] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        labels: Optional[Union[np.ndarray, tf.Tensor]] = None,
+        training: Optional[bool] = False,
         **kwargs,
-    ):
+    ) -> Union[TFTokenClassifierOutput, Tuple[tf.Tensor]]:
         r"""
-        labels (:obj:`tf.Tensor` of shape :obj:`(batch_size, sequence_length)`, `optional`):
-            Labels for computing the token classification loss.
-            Indices should be in ``[0, ..., config.num_labels - 1]``.
+        labels (:obj:`tf.Tensor` or :obj:`np.ndarray` of shape :obj:`(batch_size, sequence_length)`, `optional`):
+            Labels for computing the token classification loss. Indices should be in ``[0, ..., config.num_labels -
+            1]``.
         """
         inputs = input_processing(
             func=self.call,
@@ -1269,7 +1322,7 @@ class TF{{cookiecutter.camelcase_modelname}}ForTokenClassification(TF{{cookiecut
             kwargs_call=kwargs,
         )
         outputs = self.{{cookiecutter.lowercase_modelname}}(
-            inputs["input_ids"],
+            input_ids=inputs["input_ids"],
             attention_mask=inputs["attention_mask"],
             token_type_ids=inputs["token_type_ids"],
             position_ids=inputs["position_ids"],
@@ -1281,9 +1334,9 @@ class TF{{cookiecutter.camelcase_modelname}}ForTokenClassification(TF{{cookiecut
             training=inputs["training"],
         )
         sequence_output = outputs[0]
-        sequence_output = self.dropout(sequence_output, training=inputs["training"])
-        logits = self.classifier(sequence_output)
-        loss = None if inputs["labels"] is None else self.compute_loss(inputs["labels"], logits)
+        sequence_output = self.dropout(inputs=sequence_output, training=inputs["training"])
+        logits = self.classifier(inputs=sequence_output)
+        loss = None if inputs["labels"] is None else self.compute_loss(labels=inputs["labels"], logits=logits)
 
         if not inputs["return_dict"]:
             output = (logits,) + outputs[1:]
@@ -1296,6 +1349,13 @@ class TF{{cookiecutter.camelcase_modelname}}ForTokenClassification(TF{{cookiecut
             attentions=outputs.attentions,
         )
 
+    # Copied from transformers.models.bert.modeling_tf_bert.TFBertForTokenClassification.serving_output
+    def serving_output(self, output: TFTokenClassifierOutput) -> TFTokenClassifierOutput:
+        hs = tf.convert_to_tensor(output.hidden_states) if self.config.output_hidden_states else None
+        attns = tf.convert_to_tensor(output.attentions) if self.config.output_attentions else None
+
+        return TFTokenClassifierOutput(logits=output.logits, hidden_states=hs, attentions=attns)
+
 
 @add_start_docstrings(
     """{{cookiecutter.modelname}} Model with a span classification head on top for extractive question-answering tasks like SQuAD (a linear
@@ -1304,47 +1364,48 @@ class TF{{cookiecutter.camelcase_modelname}}ForTokenClassification(TF{{cookiecut
 )
 class TF{{cookiecutter.camelcase_modelname}}ForQuestionAnswering(TF{{cookiecutter.camelcase_modelname}}PreTrainedModel, TFQuestionAnsweringLoss):
 
-    def __init__(self, config, *inputs, **kwargs):
+    def __init__(self, config: {{cookiecutter.camelcase_modelname}}Config, *inputs, **kwargs):
         super().__init__(config, *inputs, **kwargs)
 
         self.num_labels = config.num_labels
+
         self.{{cookiecutter.lowercase_modelname}} = TF{{cookiecutter.camelcase_modelname}}MainLayer(config, name="{{cookiecutter.lowercase_modelname}}")
         self.qa_outputs = tf.keras.layers.Dense(
-            config.num_labels, kernel_initializer=get_initializer(config.initializer_range), name="qa_outputs"
+            units=config.num_labels, kernel_initializer=get_initializer(config.initializer_range), name="qa_outputs"
         )
 
     @add_start_docstrings_to_model_forward({{cookiecutter.uppercase_modelname}}_INPUTS_DOCSTRING.format("batch_size, sequence_length"))
     @add_code_sample_docstrings(
         tokenizer_class=_TOKENIZER_FOR_DOC,
-        checkpoint="{{cookiecutter.checkpoint_identifier}}",
+        checkpoint=_CHECKPOINT_FOR_DOC,
         output_type=TFQuestionAnsweringModelOutput,
         config_class=_CONFIG_FOR_DOC,
     )
     def call(
         self,
-        input_ids=None,
-        attention_mask=None,
-        token_type_ids=None,
-        position_ids=None,
-        head_mask=None,
-        inputs_embeds=None,
-        output_attentions=None,
-        output_hidden_states=None,
-        return_dict=None,
-        start_positions=None,
-        end_positions=None,
-        training=False,
+        input_ids: Optional[TFModelInputType] = None,
+        attention_mask: Optional[Union[np.ndarray, tf.Tensor]] = None,
+        token_type_ids: Optional[Union[np.ndarray, tf.Tensor]] = None,
+        position_ids: Optional[Union[np.ndarray, tf.Tensor]] = None,
+        head_mask: Optional[Union[np.ndarray, tf.Tensor]] = None,
+        inputs_embeds: Optional[Union[np.ndarray, tf.Tensor]] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        start_positions: Optional[Union[np.ndarray, tf.Tensor]] = None,
+        end_positions: Optional[Union[np.ndarray, tf.Tensor]] = None,
+        training: Optional[bool] = False,
         **kwargs,
-    ):
+    ) -> Union[TFQuestionAnsweringModelOutput, Tuple[tf.Tensor]]:
         r"""
-        start_positions (:obj:`tf.Tensor` of shape :obj:`(batch_size,)`, `optional`):
+        start_positions (:obj:`tf.Tensor` or :obj:`np.ndarray` of shape :obj:`(batch_size,)`, `optional`):
             Labels for position (index) of the start of the labelled span for computing the token classification loss.
-            Positions are clamped to the length of the sequence (:obj:`sequence_length`).
-            Position outside of the sequence are not taken into account for computing the loss.
-        end_positions (:obj:`tf.Tensor` of shape :obj:`(batch_size,)`, `optional`):
+            Positions are clamped to the length of the sequence (:obj:`sequence_length`). Position outside of the
+            sequence are not taken into account for computing the loss.
+        end_positions (:obj:`tf.Tensor` or :obj:`np.ndarray` of shape :obj:`(batch_size,)`, `optional`):
             Labels for position (index) of the end of the labelled span for computing the token classification loss.
-            Positions are clamped to the length of the sequence (:obj:`sequence_length`).
-            Position outside of the sequence are not taken into account for computing the loss.
+            Positions are clamped to the length of the sequence (:obj:`sequence_length`). Position outside of the
+            sequence are not taken into account for computing the loss.
         """
         inputs = input_processing(
             func=self.call,
@@ -1364,7 +1425,7 @@ class TF{{cookiecutter.camelcase_modelname}}ForQuestionAnswering(TF{{cookiecutte
             kwargs_call=kwargs,
         )
         outputs = self.{{cookiecutter.lowercase_modelname}}(
-            inputs["input_ids"],
+            input_ids=inputs["input_ids"],
             attention_mask=inputs["attention_mask"],
             token_type_ids=inputs["token_type_ids"],
             position_ids=inputs["position_ids"],
@@ -1376,19 +1437,19 @@ class TF{{cookiecutter.camelcase_modelname}}ForQuestionAnswering(TF{{cookiecutte
             training=inputs["training"],
         )
         sequence_output = outputs[0]
-        logits = self.qa_outputs(sequence_output)
-        start_logits, end_logits = tf.split(logits, 2, axis=-1)
-        start_logits = tf.squeeze(start_logits, axis=-1)
-        end_logits = tf.squeeze(end_logits, axis=-1)
+        logits = self.qa_outputs(inputs=sequence_output)
+        start_logits, end_logits = tf.split(value=logits, num_or_size_splits=2, axis=-1)
+        start_logits = tf.squeeze(input=start_logits, axis=-1)
+        end_logits = tf.squeeze(input=end_logits, axis=-1)
         loss = None
 
         if inputs["start_positions"] is not None and inputs["end_positions"] is not None:
             labels = {"start_position": inputs["start_positions"]}
             labels["end_position"] = inputs["end_positions"]
-            loss = self.compute_loss(labels, (start_logits, end_logits))
+            loss = self.compute_loss(labels=labels, logits=(start_logits, end_logits))
 
         if not inputs["return_dict"]:
-            output = (start_logits, end_logits) + outputs[1:]
+            output = (start_logits, end_logits) + outputs[2:]
             return ((loss,) + output) if loss is not None else output
 
         return TFQuestionAnsweringModelOutput(
@@ -1399,8 +1460,16 @@ class TF{{cookiecutter.camelcase_modelname}}ForQuestionAnswering(TF{{cookiecutte
             attentions=outputs.attentions,
         )
 
+    # Copied from transformers.models.bert.modeling_tf_bert.TFBertForQuestionAnswering.serving_output
+    def serving_output(self, output: TFQuestionAnsweringModelOutput) -> TFQuestionAnsweringModelOutput:
+        hs = tf.convert_to_tensor(output.hidden_states) if self.config.output_hidden_states else None
+        attns = tf.convert_to_tensor(output.attentions) if self.config.output_attentions else None
+
+        return TFQuestionAnsweringModelOutput(
+            start_logits=output.start_logits, end_logits=output.end_logits, hidden_states=hs, attentions=attns
+        )
+
 {% else %}
-import math
 import random
 from typing import Dict, Optional, Tuple, Union
 
@@ -1415,7 +1484,7 @@ from ...file_utils import (
 )
 from ...modeling_tf_outputs import (
     TFBaseModelOutput,
-    TFBaseModelOutputWithPast,
+    TFBaseModelOutputWithPastAndCrossAttentions,
     TFSeq2SeqLMOutput,
     TFSeq2SeqModelOutput,
 )
@@ -1436,6 +1505,7 @@ from .configuration_{{cookiecutter.lowercase_modelname}} import {{cookiecutter.c
 
 logger = logging.get_logger(__name__)
 
+_CHECKPOINT_FOR_DOC = "{{cookiecutter.checkpoint_identifier}}"
 _CONFIG_FOR_DOC = "{{cookiecutter.camelcase_modelname}}Config"
 _TOKENIZER_FOR_DOC = "{{cookiecutter.camelcase_modelname}}Tokenizer"
 
@@ -1444,21 +1514,20 @@ LARGE_NEGATIVE = -1e8
 
 
 def shift_tokens_right(input_ids: tf.Tensor, pad_token_id: int, decoder_start_token_id: int):
-    shifted_input_ids = tf.cast(input_ids, tf.int32)
-    shifted_input_ids = tf.roll(shifted_input_ids, 1, axis=-1)
-    start_tokens = tf.fill((shape_list(shifted_input_ids)[0], 1), decoder_start_token_id)
-    shifted_input_ids = tf.concat([start_tokens, shifted_input_ids[:, 1:]], -1)
+    start_tokens = tf.fill((shape_list(input_ids)[0], 1), decoder_start_token_id)
+    shifted_input_ids = tf.concat([start_tokens, input_ids[:, :-1]], -1)
     # replace possible -100 values in labels by `pad_token_id`
     shifted_input_ids = tf.where(
         shifted_input_ids == -100, tf.fill(shape_list(shifted_input_ids), pad_token_id), shifted_input_ids
     )
 
-    # "Verify that `labels` has only positive values and -100"
-    assert_gte0 = tf.debugging.assert_greater_equal(shifted_input_ids, tf.cast(0, tf.int32))
+    if tf.executing_eagerly():
+        # "Verify that `labels` has only positive values and -100"
+        assert_gte0 = tf.debugging.assert_greater_equal(shifted_input_ids, tf.constant(0))
 
-    # Make sure the assertion op is called by wrapping the result in an identity no-op
-    with tf.control_dependencies([assert_gte0]):
-        shifted_input_ids = tf.identity(shifted_input_ids)
+        # Make sure the assertion op is called by wrapping the result in an identity no-op
+        with tf.control_dependencies([assert_gte0]):
+            shifted_input_ids = tf.identity(shifted_input_ids)
 
     return shifted_input_ids
 
@@ -1468,27 +1537,28 @@ def _make_causal_mask(input_ids_shape: tf.TensorShape, past_key_values_length: i
     Make causal mask used for bi-directional self-attention.
     """
     bsz, tgt_len = input_ids_shape
-    mask = tf.ones((tgt_len, tgt_len), dtype=tf.float32) * LARGE_NEGATIVE
+    mask = tf.ones((tgt_len, tgt_len)) * LARGE_NEGATIVE
     mask_cond = tf.range(shape_list(mask)[-1])
 
     mask = tf.where(mask_cond < tf.reshape(mask_cond + 1, (shape_list(mask)[-1], 1)), 0.0, mask)
-    mask = tf.cast(mask, tf.float32)
 
     if past_key_values_length > 0:
-        mask = tf.concat([tf.zeros((tgt_len, past_key_values_length), dtype=tf.float32), mask], axis=-1)
-    return tf.broadcast_to(mask[None, None, :, :], (bsz, 1, tgt_len, tgt_len + past_key_values_length))
+        mask = tf.concat([tf.zeros((tgt_len, past_key_values_length)), mask], axis=-1)
+
+    return tf.tile(mask[None, None, :, :], (bsz, 1, 1, 1))
 
 
 def _expand_mask(mask: tf.Tensor, tgt_len: Optional[int] = None, past_key_values_length: int = 0):
     """
     Expands attention_mask from `[bsz, seq_len]` to `[bsz, 1, tgt_seq_len, src_seq_len]`.
     """
-    bsz, src_len = shape_list(mask)
+    src_len = shape_list(mask)[1]
     tgt_len = tgt_len if tgt_len is not None else src_len
+    one_cst = tf.constant(1.0)
+    mask = tf.cast(mask, dtype=one_cst.dtype)
+    expanded_mask = tf.tile(mask[:, None, None, :], (1, 1, tgt_len, 1))
 
-    expanded_mask = tf.cast(tf.broadcast_to(mask[:, None, None, :], (bsz, 1, tgt_len, src_len)), tf.float32)
-
-    return (1.0 - expanded_mask) * LARGE_NEGATIVE
+    return (one_cst - expanded_mask) * LARGE_NEGATIVE
 
 
 class TF{{cookiecutter.camelcase_modelname}}LearnedPositionalEmbedding(TFSharedEmbeddings):
@@ -1496,8 +1566,7 @@ class TF{{cookiecutter.camelcase_modelname}}LearnedPositionalEmbedding(TFSharedE
     This module learns positional embeddings up to a fixed maximum size.
     """
 
-    def __init__(self, num_embeddings: int, embedding_dim: int, padding_idx: int, **kwargs):
-        assert padding_idx is not None, "padding_idx cannot be None"
+    def __init__(self, num_embeddings: int, embedding_dim: int, **kwargs):
         super().__init__(num_embeddings, embedding_dim, **kwargs)
 
     def call(self, input_shape: tf.TensorShape, past_key_values_length: int = 0):
@@ -1505,7 +1574,7 @@ class TF{{cookiecutter.camelcase_modelname}}LearnedPositionalEmbedding(TFSharedE
         bsz, seq_len = input_shape[:2]
 
         positions = tf.range(
-            past_key_values_length, seq_len + past_key_values_length, delta=1, dtype=tf.int32, name="range"
+            past_key_values_length, seq_len + past_key_values_length, delta=1, name="range"
         )
         return super().call(positions)
 
@@ -1595,18 +1664,25 @@ class TF{{cookiecutter.camelcase_modelname}}Attention(tf.keras.layers.Layer):
         src_len = shape_list(key_states)[1]
         attn_weights = tf.matmul(query_states, key_states, transpose_b=True)
 
-        tf.debugging.assert_equal(
-            shape_list(attn_weights),
-            [bsz * self.num_heads, tgt_len, src_len],
-            message=f"Attention weights should be of size {(bsz * self.num_heads, tgt_len, src_len)}, but is {shape_list(attn_weights)}",
-        )
+        # The tf.debugging asserts are not compliant with XLA then they
+        # have to be disabled in other modes than eager.
+        if tf.executing_eagerly():
+            tf.debugging.assert_equal(
+                shape_list(attn_weights),
+                [bsz * self.num_heads, tgt_len, src_len],
+                message=f"Attention weights should be of size {(bsz * self.num_heads, tgt_len, src_len)}, but is {shape_list(attn_weights)}",
+            )
 
         if attention_mask is not None:
-            tf.debugging.assert_equal(
-                shape_list(attention_mask),
-                [bsz, 1, tgt_len, src_len],
-                message=f"Attention mask should be of size {(bsz, 1, tgt_len, src_len)}, but is {shape_list(attention_mask)}",
-            )
+            # The tf.debugging asserts are not compliant with XLA then they
+            # have to be disabled in other modes than eager.
+            if tf.executing_eagerly():
+                tf.debugging.assert_equal(
+                    shape_list(attention_mask),
+                    [bsz, 1, tgt_len, src_len],
+                    message=f"Attention mask should be of size {(bsz, 1, tgt_len, src_len)}, but is {shape_list(attention_mask)}",
+                )
+
             attn_weights = tf.reshape(attn_weights, (bsz, self.num_heads, tgt_len, src_len)) + attention_mask
             attn_weights = tf.reshape(attn_weights, (bsz * self.num_heads, tgt_len, src_len))
 
@@ -1616,11 +1692,14 @@ class TF{{cookiecutter.camelcase_modelname}}Attention(tf.keras.layers.Layer):
 
         attn_output = tf.matmul(attn_probs, value_states)
 
-        tf.debugging.assert_equal(
-            shape_list(attn_output),
-            [bsz * self.num_heads, tgt_len, self.head_dim],
-            message=f"`attn_output` should be of size {(bsz, self.num_heads, tgt_len, self.head_dim)}, but is {shape_list(attn_output)}",
-        )
+        # The tf.debugging asserts are not compliant with XLA then they
+        # have to be disabled in other modes than eager.
+        if tf.executing_eagerly():
+            tf.debugging.assert_equal(
+                shape_list(attn_output),
+                [bsz * self.num_heads, tgt_len, self.head_dim],
+                message=f"`attn_output` should be of size {(bsz, self.num_heads, tgt_len, self.head_dim)}, but is {shape_list(attn_output)}",
+            )
 
         attn_output = tf.transpose(
             tf.reshape(attn_output, (bsz, self.num_heads, tgt_len, self.head_dim)), (0, 2, 1, 3)
@@ -1648,22 +1727,29 @@ class TF{{cookiecutter.camelcase_modelname}}EncoderLayer(tf.keras.layers.Layer):
         self.fc2 = tf.keras.layers.Dense(self.embed_dim, name="fc2")
         self.final_layer_norm = tf.keras.layers.LayerNormalization(epsilon=1e-5, name="final_layer_norm")
 
-    def call(self, hidden_states: tf.Tensor, attention_mask: tf.Tensor, training=False):
+    def call(self, hidden_states: tf.Tensor, attention_mask: tf.Tensor, layer_head_mask: tf.Tensor, training=False):
         """
         Args:
             hidden_states (:obj:`tf.Tensor`): input to the layer of shape `(seq_len, batch, embed_dim)`
             attention_mask (:obj:`tf.Tensor`): attention mask of size
                 `(batch, 1, tgt_len, src_len)` where padding elements are indicated by very large negative values.
+            layer_head_mask (:obj:`tf.Tensor`): mask for attention heads in a given layer of size
+                `(encoder_attention_heads,)`
         """
         residual = hidden_states
         hidden_states, self_attn_weights, _ = self.self_attn(
-            hidden_states=hidden_states, attention_mask=attention_mask
+            hidden_states=hidden_states, attention_mask=attention_mask, layer_head_mask=layer_head_mask
         )
-        tf.debugging.assert_equal(
-            shape_list(hidden_states),
-            shape_list(residual),
-            message=f"Self attn modified the shape of query {shape_list(residual)} to {shape_list(hidden_states)}",
-        )
+
+        # The tf.debugging asserts are not compliant with XLA then they
+        # have to be disabled in other modes than eager.
+        if tf.executing_eagerly():
+            tf.debugging.assert_equal(
+                shape_list(hidden_states),
+                shape_list(residual),
+                message=f"Self attn modified the shape of query {shape_list(residual)} to {shape_list(hidden_states)}",
+            )
+
         hidden_states = self.dropout(hidden_states, training=training)
         hidden_states = residual + hidden_states
         hidden_states = self.self_attn_layer_norm(hidden_states)
@@ -1713,6 +1799,8 @@ class TF{{cookiecutter.camelcase_modelname}}DecoderLayer(tf.keras.layers.Layer):
         attention_mask: Optional[tf.Tensor] = None,
         encoder_hidden_states: Optional[tf.Tensor] = None,
         encoder_attention_mask: Optional[tf.Tensor] = None,
+        layer_head_mask: Optional[tf.Tensor] = None,
+        cross_attn_layer_head_mask: Optional[tf.Tensor] = None,
         past_key_value: Optional[Tuple[tf.Tensor]] = None,
         training=False,
     ) -> Tuple[tf.Tensor, tf.Tensor, Tuple[Tuple[tf.Tensor]]]:
@@ -1724,6 +1812,10 @@ class TF{{cookiecutter.camelcase_modelname}}DecoderLayer(tf.keras.layers.Layer):
             encoder_hidden_states (:obj:`tf.Tensor`): cross attention input to the layer of shape `(seq_len, batch, embed_dim)`
             encoder_attention_mask (:obj:`tf.Tensor`): encoder attention mask of size
                 `(batch, 1, tgt_len, src_len)` where padding elements are indicated by very large negative values.
+            layer_head_mask (:obj:`tf.Tensor`): mask for attention heads in a given layer of size
+                `(decoder_attention_heads,)`
+            cross_attn_layer_head_mask (:obj:`tf.Tensor`): mask for heads of the cross-attention module.
+                `(decoder_attention_heads,)`
             past_key_value (:obj:`Tuple(tf.Tensor)`): cached past key and value projection states
         """
         residual = hidden_states
@@ -1736,6 +1828,7 @@ class TF{{cookiecutter.camelcase_modelname}}DecoderLayer(tf.keras.layers.Layer):
             hidden_states=hidden_states,
             past_key_value=self_attn_past_key_value,
             attention_mask=attention_mask,
+            layer_head_mask=layer_head_mask,
         )
         hidden_states = self.dropout(hidden_states, training=training)
         hidden_states = residual + hidden_states
@@ -1743,15 +1836,17 @@ class TF{{cookiecutter.camelcase_modelname}}DecoderLayer(tf.keras.layers.Layer):
 
         # Cross-Attention Block
         cross_attn_present_key_value = None
+        cross_attn_weights = None
         if encoder_hidden_states is not None:
             residual = hidden_states
 
             # cross_attn cached key/values tuple is at positions 3,4 of present_key_value tuple
             cross_attn_past_key_value = past_key_value[-2:] if past_key_value is not None else None
-            hidden_states, _, cross_attn_present_key_value = self.encoder_attn(
+            hidden_states, cross_attn_weights, cross_attn_present_key_value = self.encoder_attn(
                 hidden_states=hidden_states,
                 key_value_states=encoder_hidden_states,
                 attention_mask=encoder_attention_mask,
+                layer_head_mask=cross_attn_layer_head_mask,
                 past_key_value=cross_attn_past_key_value,
             )
             hidden_states = self.dropout(hidden_states, training=training)
@@ -1773,6 +1868,7 @@ class TF{{cookiecutter.camelcase_modelname}}DecoderLayer(tf.keras.layers.Layer):
         return (
             hidden_states,
             self_attn_weights,
+            cross_attn_layer_head_mask,
             present_key_value,
         )
 
@@ -1792,6 +1888,22 @@ class TF{{cookiecutter.camelcase_modelname}}PreTrainedModel(TFPreTrainedModel):
             "input_ids": input_ids,
         }
         return dummy_inputs
+
+    @tf.function(
+        input_signature=[
+            {
+                "input_ids": tf.TensorSpec((None, None), tf.int32, name="input_ids"),
+                "attention_mask": tf.TensorSpec((None, None), tf.int32, name="attention_mask"),
+                "decoder_input_ids": tf.TensorSpec((None, None), tf.int32, name="decoder_input_ids"),
+                "decoder_attention_mask": tf.TensorSpec((None, None), tf.int32, name="decoder_attention_mask"),
+            }
+        ]
+    )
+    # Copied from transformers.models.bart.modeling_tf_bart.TFBartPretrainedModel.serving
+    def serving(self, inputs):
+        output = self.call(inputs)
+
+        return self.serving_output(output)
 
 
 {{cookiecutter.uppercase_modelname}}_START_DOCSTRING = r"""
@@ -1834,7 +1946,7 @@ class TF{{cookiecutter.camelcase_modelname}}PreTrainedModel(TFPreTrainedModel):
         input_ids (:obj:`tf.Tensor` of shape :obj:`({0})`):
             Indices of input sequence tokens in the vocabulary.
 
-            Indices can be obtained using :class:`~transformers.BertTokenizer`. See
+            Indices can be obtained using :class:`~transformers.{{cookiecutter.camelcase_modelname}}Tokenizer`. See
             :meth:`transformers.PreTrainedTokenizer.encode` and :meth:`transformers.PreTrainedTokenizer.__call__` for
             details.
 
@@ -1847,10 +1959,41 @@ class TF{{cookiecutter.camelcase_modelname}}PreTrainedModel(TFPreTrainedModel):
 
             `What are attention masks? <../glossary.html#attention-mask>`__
         decoder_input_ids (:obj:`tf.Tensor` of shape :obj:`(batch_size, target_sequence_length)`, `optional`):
-            Provide for translation and summarization training. By default, the model will create this tensor by
-            shifting the input_ids right, following the paper.
-        decoder_attention_mask (:obj:`tf.Tensor` of shape :obj:`(batch_size, tgt_seq_len)`, `optional`):
+            Indices of decoder input sequence tokens in the vocabulary.
+
+            Indices can be obtained using :class:`~transformers.{{cookiecutter.camelcase_modelname}}Tokenizer`. See
+            :meth:`transformers.PreTrainedTokenizer.encode` and :meth:`transformers.PreTrainedTokenizer.__call__` for
+            details.
+
+            `What are input IDs? <../glossary.html#input-ids>`__
+
+            {{cookiecutter.camelcase_modelname}} uses the :obj:`eos_token_id` as the starting token for
+            :obj:`decoder_input_ids` generation. If :obj:`past_key_values` is used, optionally only the last
+            :obj:`decoder_input_ids` have to be input (see :obj:`past_key_values`).
+
+            For translation and summarization training, :obj:`decoder_input_ids` should be provided. If no
+            :obj:`decoder_input_ids` is provided, the model will create this tensor by shifting the :obj:`input_ids` to
+            the right for denoising pre-training following the paper.
+        decoder_attention_mask (:obj:`tf.Tensor` of shape :obj:`(batch_size, target_sequence_length)`, `optional`):
             will be made by default and ignore pad tokens. It is not recommended to set this for most use cases.
+        head_mask (:obj:`tf.Tensor` of shape :obj:`(encoder_layers, encoder_attention_heads)`, `optional`):
+            Mask to nullify selected heads of the attention modules in the encoder. Mask values selected in ``[0, 1]``:
+
+            - 1 indicates the head is **not masked**,
+            - 0 indicates the head is **masked**.
+
+        decoder_head_mask (:obj:`tf.Tensor` of shape :obj:`(decoder_layers, decoder_attention_heads)`, `optional`):
+            Mask to nullify selected heads of the attention modules in the decoder. Mask values selected in ``[0, 1]``:
+
+            - 1 indicates the head is **not masked**,
+            - 0 indicates the head is **masked**.
+
+        cross_attn_head_mask (:obj:`tf.Tensor` of shape :obj:`(decoder_layers, decoder_attention_heads)`, `optional`):
+            Mask to nullify selected heads of the cross-attention modules. Mask values selected in ``[0, 1]``:
+
+            - 1 indicates the head is **not masked**,
+            - 0 indicates the head is **masked**.
+
         encoder_outputs (:obj:`tf.FloatTensor`, `optional`):
             hidden states at the output of the last layer of the encoder. Used in the cross-attention of the decoder.
             of shape :obj:`(batch_size, sequence_length, hidden_size)` is a sequence of
@@ -1864,12 +2007,15 @@ class TF{{cookiecutter.camelcase_modelname}}PreTrainedModel(TFPreTrainedModel):
             decoding (see :obj:`past_key_values`). Set to :obj:`False` during training, :obj:`True` during generation
         output_attentions (:obj:`bool`, `optional`):
             Whether or not to return the attentions tensors of all attention layers. See ``attentions`` under returned
-            tensors for more detail.
+            tensors for more detail. This argument can be used only in eager mode, in graph mode the value in the
+            config will be used instead.
         output_hidden_states (:obj:`bool`, `optional`):
             Whether or not to return the hidden states of all layers. See ``hidden_states`` under returned tensors for
-            more detail.
+            more detail. This argument can be used only in eager mode, in graph mode the value in the config will be
+            used instead.
         return_dict (:obj:`bool`, `optional`):
-            Whether or not to return a :class:`~transformers.file_utils.TFModelOutput` instead of a plain tuple.
+            Whether or not to return a :class:`~transformers.file_utils.ModelOutput` instead of a plain tuple. This
+            argument can be used in eager mode, in graph mode the value will always be set to True.
         training (:obj:`bool`, `optional`, defaults to :obj:`False`):
             Whether or not to use the model in training mode (some modules like dropout modules have different
             behaviors between training and evaluation).
@@ -1894,24 +2040,29 @@ class TF{{cookiecutter.camelcase_modelname}}Encoder(tf.keras.layers.Layer):
         self.layerdrop = config.encoder_layerdrop
         self.padding_idx = config.pad_token_id
         self.max_source_positions = config.max_position_embeddings
-        self.embed_scale = math.sqrt(config.d_model) if config.scale_embedding else 1.0
-
+        self.embed_scale = tf.math.sqrt(float(config.d_model)) if config.scale_embedding else 1.0
 
         self.embed_tokens = embed_tokens
         self.embed_positions = TF{{cookiecutter.camelcase_modelname}}LearnedPositionalEmbedding(
             config.max_position_embeddings,
             config.d_model,
-            self.padding_idx,
             name="embed_positions",
         )
         self.layers = [TF{{cookiecutter.camelcase_modelname}}EncoderLayer(config, name=f"layers.{i}") for i in range(config.encoder_layers)]
         self.layernorm_embedding = tf.keras.layers.LayerNormalization(epsilon=1e-5, name="layernorm_embedding")
+
+    def get_embed_tokens(self):
+        return self.embed_tokens
+
+    def set_embed_tokens(self, embed_tokens):
+        self.embed_tokens = embed_tokens
 
     def call(
         self,
         input_ids=None,
         inputs_embeds=None,
         attention_mask=None,
+        head_mask=None,
         output_attentions=None,
         output_hidden_states=None,
         return_dict=None,
@@ -1936,24 +2087,37 @@ class TF{{cookiecutter.camelcase_modelname}}Encoder(tf.keras.layers.Layer):
                 - 0 for tokens that are **masked**.
 
                 `What are attention masks? <../glossary.html#attention-mask>`__
+            head_mask (:obj:`tf.Tensor` of shape :obj:`(encoder_layers, encoder_attention_heads)`, `optional):
+                Mask to nullify selected heads of the attention modules. Mask values selected in ``[0, 1]``:
+
+                - 1 indicates the head is **not masked**,
+                - 0 indicates the head is **masked**.
+
             inputs_embeds (:obj:`tf.Tensor` of shape :obj:`(batch_size, sequence_length, hidden_size)`, `optional`):
                 Optionally, instead of passing :obj:`input_ids` you can choose to directly pass an embedded
                 representation. This is useful if you want more control over how to convert :obj:`input_ids` indices
                 into associated vectors than the model's internal embedding lookup matrix.
             output_attentions (:obj:`bool`, `optional`):
                 Whether or not to return the attentions tensors of all attention layers. See ``attentions`` under
-                returned tensors for more detail.
+                returned tensors for more detail. This argument can be used only in eager mode, in graph mode the value
+                in the config will be used instead.
             output_hidden_states (:obj:`bool`, `optional`):
                 Whether or not to return the hidden states of all layers. See ``hidden_states`` under returned tensors
-                for more detail.
+                for more detail. This argument can be used only in eager mode, in graph mode the value in the config
+                will be used instead.
             return_dict (:obj:`bool`, `optional`):
-                Whether or not to return a :class:`~transformers.file_utils.ModelOutput` instead of a plain tuple.
+                Whether or not to return a :class:`~transformers.file_utils.ModelOutput` instead of a plain tuple. This
+                argument can be used in eager mode, in graph mode the value will always be set to True.
+            training (:obj:`bool`, `optional`, defaults to :obj:`False`):
+                Whether or not to use the model in training mode (some modules like dropout modules have different
+                behaviors between training and evaluation).
         """
         inputs = input_processing(
             func=self.call,
             config=self.config,
             input_ids=input_ids,
             attention_mask=attention_mask,
+            head_mask=head_mask,
             inputs_embeds=inputs_embeds,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
@@ -1973,28 +2137,32 @@ class TF{{cookiecutter.camelcase_modelname}}Encoder(tf.keras.layers.Layer):
 
         if inputs["inputs_embeds"] is None:
             inputs_embeds = self.embed_tokens(inputs["input_ids"]) * self.embed_scale
-        else:
-            inputs_embeds = inputs["inputs_embeds"]
-
-        inputs_embeds = inputs_embeds
 
         embed_pos = self.embed_positions(input_shape)
-        hidden_states = inputs_embeds + embed_pos
+        hidden_states = inputs["inputs_embeds"] + embed_pos
         hidden_states = self.layernorm_embedding(hidden_states)
         hidden_states = self.dropout(hidden_states, training=inputs["training"])
 
         # check attention mask and invert
         if inputs["attention_mask"] is not None:
             # [bsz, seq_len] -> [bsz, 1, tgt_seq_len, src_seq_len]
-            attention_mask = _expand_mask(inputs["attention_mask"])
-        else:
-            attention_mask = None
+            inputs["attention_mask"] = _expand_mask(inputs["attention_mask"])
 
         encoder_states = () if inputs["output_hidden_states"] else None
         all_attentions = () if inputs["output_attentions"] else None
 
+        # check if head_mask has a correct number of layers specified if desired
+        # The tf.debugging asserts are not compliant with XLA then they
+        # have to be disabled in other modes than eager.
+        if inputs["head_mask"] is not None and tf.executing_eagerly():
+            tf.debugging.assert_equal(
+                shape_list(inputs["head_mask"])[0],
+                len(self.layers),
+                message=f"The head_mask should be specified for {len(self.layers)} layers, but it is for {shape_list(inputs['head_mask'])[0]}.",
+            )
+
         # encoder layers
-        for encoder_layer in self.layers:
+        for idx, encoder_layer in enumerate(self.layers):
 
             if inputs["output_hidden_states"]:
                 encoder_states = encoder_states + (hidden_states,)
@@ -2003,7 +2171,11 @@ class TF{{cookiecutter.camelcase_modelname}}Encoder(tf.keras.layers.Layer):
             if inputs["training"] and (dropout_probability < self.layerdrop):  # skip the layer
                 continue
 
-            hidden_states, attn = encoder_layer(hidden_states, attention_mask)
+            hidden_states, attn = encoder_layer(
+                hidden_states,
+                inputs["attention_mask"],
+                inputs["head_mask"][idx] if inputs["head_mask"] is not None else None,
+            )
 
             if inputs["output_attentions"]:
                 all_attentions += (attn,)
@@ -2038,14 +2210,19 @@ class TF{{cookiecutter.camelcase_modelname}}Decoder(tf.keras.layers.Layer):
         self.embed_positions = TF{{cookiecutter.camelcase_modelname}}LearnedPositionalEmbedding(
             config.max_position_embeddings,
             config.d_model,
-            self.padding_idx,
             name="embed_positions",
         )
-        self.embed_scale = math.sqrt(config.d_model) if config.scale_embedding else 1.0
+        self.embed_scale = tf.math.sqrt(float(config.d_model)) if config.scale_embedding else 1.0
         self.layers = [TF{{cookiecutter.camelcase_modelname}}DecoderLayer(config, name=f"layers.{i}") for i in range(config.decoder_layers)]
         self.layernorm_embedding = tf.keras.layers.LayerNormalization(epsilon=1e-5, name="layernorm_embedding")
 
         self.dropout = tf.keras.layers.Dropout(config.dropout)
+
+    def get_embed_tokens(self):
+        return self.embed_tokens
+
+    def set_embed_tokens(self, embed_tokens):
+        self.embed_tokens = embed_tokens
 
     def call(
         self,
@@ -2054,6 +2231,8 @@ class TF{{cookiecutter.camelcase_modelname}}Decoder(tf.keras.layers.Layer):
         attention_mask=None,
         encoder_hidden_states=None,
         encoder_attention_mask=None,
+        head_mask=None,
+        cross_attn_head_mask=None,
         past_key_values=None,
         use_cache=None,
         output_attentions=None,
@@ -2091,6 +2270,18 @@ class TF{{cookiecutter.camelcase_modelname}}Decoder(tf.keras.layers.Layer):
                 - 0 for tokens that are **masked**.
 
                 `What are attention masks? <../glossary.html#attention-mask>`__
+            head_mask (:obj:`tf.Tensor` of shape :obj:`(decoder_layers, decoder_attention_heads)`, `optional`):
+                Mask to nullify selected heads of the attention modules. Mask values selected in ``[0, 1]``:
+
+                - 1 indicates the head is **not masked**,
+                - 0 indicates the head is **masked**.
+
+            cross_attn_head_mask (:obj:`tf.Tensor` of shape :obj:`(decoder_layers, decoder_attention_heads)`, `optional`):
+                Mask to nullify selected heads of the cross-attention modules. Mask values selected in ``[0, 1]``:
+
+                - 1 indicates the head is **not masked**,
+                - 0 indicates the head is **masked**.
+
             past_key_values (:obj:`Tuple[Tuple[tf.Tensor]]` of length :obj:`config.n_layers` with each tuple having 2 tuples each of which has 2 tensors of shape :obj:`(batch_size, num_heads, sequence_length - 1, embed_size_per_head)`):
                 Contains precomputed key and value hidden-states of the attention blocks. Can be used to speed up
                 decoding.
@@ -2105,12 +2296,18 @@ class TF{{cookiecutter.camelcase_modelname}}Decoder(tf.keras.layers.Layer):
                 into associated vectors than the model's internal embedding lookup matrix.
             output_attentions (:obj:`bool`, `optional`):
                 Whether or not to return the attentions tensors of all attention layers. See ``attentions`` under
-                returned tensors for more detail.
+                returned tensors for more detail. This argument can be used only in eager mode, in graph mode the value
+                in the config will be used instead.
             output_hidden_states (:obj:`bool`, `optional`):
                 Whether or not to return the hidden states of all layers. See ``hidden_states`` under returned tensors
-                for more detail.
+                for more detail. This argument can be used only in eager mode, in graph mode the value in the config
+                will be used instead.
             return_dict (:obj:`bool`, `optional`):
-                Whether or not to return a :class:`~transformers.file_utils.ModelOutput` instead of a plain tuple.
+                Whether or not to return a :class:`~transformers.file_utils.ModelOutput` instead of a plain tuple. This
+                argument can be used in eager mode, in graph mode the value will always be set to True.
+            training (:obj:`bool`, `optional`, defaults to :obj:`False`):
+                Whether or not to use the model in training mode (some modules like dropout modules have different
+                behaviors between training and evaluation).
         """
         inputs = input_processing(
             func=self.call,
@@ -2119,6 +2316,8 @@ class TF{{cookiecutter.camelcase_modelname}}Decoder(tf.keras.layers.Layer):
             attention_mask=attention_mask,
             encoder_hidden_states=encoder_hidden_states,
             encoder_attention_mask=encoder_attention_mask,
+            head_mask=head_mask,
+            cross_attn_head_mask=cross_attn_head_mask,
             inputs_embeds=inputs_embeds,
             past_key_values=past_key_values,
             use_cache=use_cache,
@@ -2146,10 +2345,96 @@ class TF{{cookiecutter.camelcase_modelname}}Decoder(tf.keras.layers.Layer):
         positions = self.embed_positions(input_shape, past_key_values_length)
 
         if inputs["inputs_embeds"] is None:
-            inputs["inputs_embeds"] = self.embed_tokens(inputs["input_ids"]) * self.embed_scale
+            inputs["inputs_embeds"] = self.embed_tokens(inputs["input_ids"])
 
         hidden_states = inputs["inputs_embeds"]
 
+        inputs["attention_mask"], combined_attention_mask = self.compute_combined_attns_mask(
+            inputs, input_shape, past_key_values_length
+        )
+
+        if inputs["encoder_hidden_states"] is not None and inputs["encoder_attention_mask"] is not None:
+            # [bsz, seq_len] -> [bsz, 1, tgt_seq_len, src_seq_len]
+            inputs["encoder_attention_mask"] = _expand_mask(inputs["encoder_attention_mask"], tgt_len=input_shape[-1])
+
+        hidden_states = self.layernorm_embedding(hidden_states + positions)
+        hidden_states = self.dropout(hidden_states, training=inputs["training"])
+
+        # decoder layers
+        all_hidden_states = () if inputs["output_hidden_states"] else None
+        all_self_attns = () if inputs["output_attentions"] else None
+        all_cross_attns = () if (inputs["output_attentions"] and inputs["encoder_hidden_states"] is not None) else None
+        present_key_values = () if inputs["use_cache"] else None
+
+        # check if head_mask and cross_attn_head_mask have a correct number of layers specified if desired
+        # The tf.debugging asserts are not compliant with XLA then they
+        # have to be disabled in other modes than eager.
+        for attn_mask in ["head_mask", "cross_attn_head_mask"]:
+            if inputs[attn_mask] is not None and tf.executing_eagerly():
+                tf.debugging.assert_equal(
+                    shape_list(inputs[attn_mask])[0],
+                    len(self.layers),
+                    message=f"The {attn_mask} should be specified for {len(self.layers)} layers, but it is for {shape_list(inputs[attn_mask])[0]}.",
+                )
+
+        for idx, decoder_layer in enumerate(self.layers):
+            # add LayerDrop (see https://arxiv.org/abs/1909.11556 for description)
+            if inputs["output_hidden_states"]:
+                all_hidden_states += (hidden_states,)
+
+            dropout_probability = random.uniform(0, 1)
+
+            if inputs["training"] and (dropout_probability < self.layerdrop):
+                continue
+
+            past_key_value = inputs["past_key_values"][idx] if inputs["past_key_values"] is not None else None
+
+            hidden_states, layer_self_attn, layer_cross_attn, present_key_value = decoder_layer(
+                hidden_states,
+                attention_mask=combined_attention_mask,
+                encoder_hidden_states=inputs["encoder_hidden_states"],
+                encoder_attention_mask=inputs["encoder_attention_mask"],
+                layer_head_mask=inputs["head_mask"][idx] if inputs["head_mask"] is not None else None,
+                cross_attn_layer_head_mask=inputs["cross_attn_head_mask"][idx]
+                if inputs["cross_attn_head_mask"] is not None
+                else None,
+                past_key_value=past_key_value,
+            )
+
+            if inputs["use_cache"]:
+                present_key_values += (present_key_value,)
+
+            if inputs["output_attentions"]:
+                all_self_attns += (layer_self_attn,)
+
+                if inputs["encoder_hidden_states"] is not None:
+                    all_cross_attns += (layer_cross_attn,)
+
+        if inputs["output_hidden_states"]:
+            all_hidden_states += (hidden_states,)
+
+        if inputs["output_attentions"]:
+            all_self_attns = list(all_self_attns)
+
+            if inputs["encoder_hidden_states"] is not None:
+                all_cross_attns = list(all_cross_attns)
+
+        if inputs["use_cache"]:
+            present_key_values = (inputs["encoder_hidden_states"], present_key_values)
+
+        if not inputs["return_dict"]:
+            return hidden_states, present_key_values, all_hidden_states, all_self_attns, all_cross_attns
+        else:
+            return TFBaseModelOutputWithPastAndCrossAttentions(
+                last_hidden_state=hidden_states,
+                past_key_values=present_key_values,
+                hidden_states=all_hidden_states,
+                attentions=all_self_attns,
+                cross_attentions=all_cross_attns,
+            )
+
+    @tf.function
+    def compute_combined_attns_mask(self, inputs, input_shape, past_key_values_length):
         # [bsz, seq_len] -> [bsz, 1, tgt_seq_len, src_seq_len]
         combined_attention_mask = None
         if input_shape[-1] > 1:
@@ -2160,87 +2445,30 @@ class TF{{cookiecutter.camelcase_modelname}}Decoder(tf.keras.layers.Layer):
             )
 
         if inputs["attention_mask"] is None and inputs["input_ids"] is not None and input_shape[-1] > 1:
-            inputs["attention_mask"] = tf.cast(
+            attention_mask = tf.cast(
                 tf.math.not_equal(inputs["input_ids"], self.config.pad_token_id), inputs["input_ids"].dtype
             )
-            inputs["attention_mask"] = tf.concat(
+            attention_mask = tf.concat(
                 [
-                    tf.ones((input_shape[0], past_key_values_length), dtype=inputs["attention_mask"].dtype),
-                    inputs["attention_mask"],
+                    tf.ones((input_shape[0], past_key_values_length), dtype=attention_mask.dtype),
+                    attention_mask,
                 ],
                 axis=-1,
             )
         else:
-            inputs["attention_mask"] = tf.ones(
-                (input_shape[0], input_shape[1] + past_key_values_length), dtype=tf.int32
-            )
+            attention_mask = tf.ones((input_shape[0], input_shape[1] + past_key_values_length))
 
-        if inputs["encoder_hidden_states"] is not None and inputs["encoder_attention_mask"] is not None:
-            # [bsz, seq_len] -> [bsz, 1, tgt_seq_len, src_seq_len]
-            inputs["encoder_attention_mask"] = _expand_mask(inputs["encoder_attention_mask"], tgt_len=input_shape[-1])
-
-        hidden_states = self.layernorm_embedding(hidden_states + positions)
-        hidden_states = self.dropout(hidden_states, training=inputs["training"])
-
-        # decoder layers
-        all_hidden_states = ()
-        all_self_attns = ()
-        present_key_values = ()
-        for idx, decoder_layer in enumerate(self.layers):
-            # add LayerDrop (see https://arxiv.org/abs/1909.11556 for description)
-            if inputs["output_hidden_states"]:
-                all_hidden_states += (hidden_states,)
-            dropout_probability = random.uniform(0, 1)
-
-            if inputs["training"] and (dropout_probability < self.layerdrop):
-                continue
-
-            past_key_value = inputs["past_key_values"][idx] if inputs["past_key_values"] is not None else None
-
-            hidden_states, layer_self_attn, present_key_value = decoder_layer(
-                hidden_states,
-                attention_mask=combined_attention_mask,
-                encoder_hidden_states=inputs["encoder_hidden_states"],
-                encoder_attention_mask=inputs["encoder_attention_mask"],
-                past_key_value=past_key_value,
-            )
-
-            if inputs["use_cache"]:
-                present_key_values += (present_key_value,)
-
-            if inputs["output_attentions"]:
-                all_self_attns += (layer_self_attn,)
-
-        if inputs["output_hidden_states"]:
-            all_hidden_states += (hidden_states,)
-        else:
-            all_hidden_states = None
-
-        all_self_attns = list(all_self_attns) if inputs["output_attentions"] else None
-
-        present_key_values = (encoder_hidden_states, present_key_values) if inputs["use_cache"] else None
-
-        if not inputs["return_dict"]:
-            return hidden_states, present_key_values, all_hidden_states, all_self_attns
-        else:
-            return TFBaseModelOutputWithPast(
-                last_hidden_state=hidden_states,
-                past_key_values=present_key_values,
-                hidden_states=all_hidden_states,
-                attentions=all_self_attns,
-            )
+        return attention_mask, combined_attention_mask
 
 
-@add_start_docstrings(
-    "The bare {{cookiecutter.uppercase_modelname}} Model outputting raw hidden-states without any specific head on top.",
-    {{cookiecutter.uppercase_modelname}}_START_DOCSTRING,
-)
 @keras_serializable
-class TF{{cookiecutter.camelcase_modelname}}Model(TF{{cookiecutter.camelcase_modelname}}PreTrainedModel):
-    base_model_prefix = "model"
+class TF{{cookiecutter.camelcase_modelname}}MainLayer(tf.keras.layers.Layer):
+    config_class = {{cookiecutter.camelcase_modelname}}Config
 
-    def __init__(self, config: {{cookiecutter.camelcase_modelname}}Config, *inputs, **kwargs):
-        super().__init__(config, *inputs, **kwargs)
+    def __init__(self, config: {{cookiecutter.camelcase_modelname}}Config, **kwargs):
+        super().__init__(**kwargs)
+
+        self.config = config
         self.shared = TFSharedEmbeddings(config.vocab_size, config.d_model, config.pad_token_id, name="model.shared")
 
         with tf.compat.v1.variable_scope("model.shared") as shared_abs_scope_name:
@@ -2254,22 +2482,29 @@ class TF{{cookiecutter.camelcase_modelname}}Model(TF{{cookiecutter.camelcase_mod
         self.encoder = TF{{cookiecutter.camelcase_modelname}}Encoder(config, embed_tokens, name="encoder")
         self.decoder = TF{{cookiecutter.camelcase_modelname}}Decoder(config, embed_tokens, name="decoder")
 
-    def get_decoder(self):
-        return self.decoder
+    def get_input_embeddings(self):
+        return self.shared
 
-    @add_start_docstrings_to_model_forward({{cookiecutter.uppercase_modelname}}_INPUTS_DOCSTRING.format("batch_size, sequence_length"))
-    @add_code_sample_docstrings(
-        tokenizer_class=_TOKENIZER_FOR_DOC,
-        checkpoint="{{cookiecutter.checkpoint_identifier}}",
-        output_type=TFSeq2SeqModelOutput,
-        config_class=_CONFIG_FOR_DOC,
-    )
+    def set_input_embeddings(self, new_embeddings):
+        self.shared.weight = new_embeddings
+        self.shared.vocab_size = self.shared.weight.shape[0]
+        # retrieve correct absolute scope for embed token wrapper
+        with tf.compat.v1.variable_scope("model.shared") as shared_abs_scope_name:
+            pass
+        # Wraps layer to avoid problems with weight restoring and ensuring we're in the correct TF scope.
+        embed_tokens = TFWrappedEmbeddings(self.shared, abs_scope_name=shared_abs_scope_name)
+        self.encoder.set_embed_tokens(embed_tokens)
+        self.decoder.set_embed_tokens(embed_tokens)
+
     def call(
         self,
         input_ids=None,
         attention_mask=None,
         decoder_input_ids=None,
         decoder_attention_mask=None,
+        head_mask=None,
+        decoder_head_mask=None,
+        cross_attn_head_mask=None,
         encoder_outputs: Optional[Union[Tuple, TFBaseModelOutput]] = None,
         past_key_values=None,
         inputs_embeds=None,
@@ -2288,6 +2523,9 @@ class TF{{cookiecutter.camelcase_modelname}}Model(TF{{cookiecutter.camelcase_mod
             attention_mask=attention_mask,
             decoder_input_ids=decoder_input_ids,
             decoder_attention_mask=decoder_attention_mask,
+            head_mask=head_mask,
+            decoder_head_mask=decoder_head_mask,
+            cross_attn_head_mask=cross_attn_head_mask,
             encoder_outputs=encoder_outputs,
             past_key_values=past_key_values,
             inputs_embeds=inputs_embeds,
@@ -2303,16 +2541,11 @@ class TF{{cookiecutter.camelcase_modelname}}Model(TF{{cookiecutter.camelcase_mod
         if inputs["decoder_input_ids"] is None and inputs["decoder_inputs_embeds"] is None:
             inputs["use_cache"] = False
 
-        inputs["output_hidden_states"] = (
-            inputs["output_hidden_states"]
-            if inputs["output_hidden_states"] is not None
-            else self.config.output_hidden_states
-        )
-
         if inputs["encoder_outputs"] is None:
             inputs["encoder_outputs"] = self.encoder(
                 input_ids=inputs["input_ids"],
                 attention_mask=inputs["attention_mask"],
+                head_mask=inputs["head_mask"],
                 inputs_embeds=inputs["inputs_embeds"],
                 output_attentions=inputs["output_attentions"],
                 output_hidden_states=inputs["output_hidden_states"],
@@ -2335,6 +2568,8 @@ class TF{{cookiecutter.camelcase_modelname}}Model(TF{{cookiecutter.camelcase_mod
             attention_mask=inputs["decoder_attention_mask"],
             encoder_hidden_states=inputs["encoder_outputs"][0],
             encoder_attention_mask=inputs["attention_mask"],
+            head_mask=inputs["decoder_head_mask"],
+            cross_attn_head_mask=inputs["cross_attn_head_mask"],
             past_key_values=inputs["past_key_values"],
             inputs_embeds=inputs["decoder_inputs_embeds"],
             use_cache=inputs["use_cache"],
@@ -2352,19 +2587,118 @@ class TF{{cookiecutter.camelcase_modelname}}Model(TF{{cookiecutter.camelcase_mod
             past_key_values=decoder_outputs.past_key_values,
             decoder_hidden_states=decoder_outputs.hidden_states,
             decoder_attentions=decoder_outputs.attentions,
+            cross_attentions=decoder_outputs.cross_attentions,
             encoder_last_hidden_state=inputs["encoder_outputs"].last_hidden_state,
             encoder_hidden_states=inputs["encoder_outputs"].hidden_states,
             encoder_attentions=inputs["encoder_outputs"].attentions,
         )
 
-    def get_input_embeddings(self):
-        return self.shared
 
-    def set_input_embeddings(self, value):
-        self.shared = value
+@add_start_docstrings(
+    "The bare {{cookiecutter.uppercase_modelname}} Model outputting raw hidden-states without any specific head on top.",
+    {{cookiecutter.uppercase_modelname}}_START_DOCSTRING,
+)
+class TF{{cookiecutter.camelcase_modelname}}Model(TF{{cookiecutter.camelcase_modelname}}PreTrainedModel):
+    def __init__(self, config: {{cookiecutter.camelcase_modelname}}Config, *inputs, **kwargs):
+        super().__init__(config, *inputs, **kwargs)
 
-    def get_output_embeddings(self):
-        return self.shared
+        self.model = TF{{cookiecutter.camelcase_modelname}}MainLayer(config, name="model")
+
+    def get_encoder(self):
+        return self.model.encoder
+
+    def get_decoder(self):
+        return self.model.decoder
+
+    @add_start_docstrings_to_model_forward({{cookiecutter.uppercase_modelname}}_INPUTS_DOCSTRING.format("batch_size, sequence_length"))
+    @add_code_sample_docstrings(
+        tokenizer_class=_TOKENIZER_FOR_DOC,
+        checkpoint=_CHECKPOINT_FOR_DOC,
+        output_type=TFSeq2SeqModelOutput,
+        config_class=_CONFIG_FOR_DOC,
+    )
+    def call(
+        self,
+        input_ids=None,
+        attention_mask=None,
+        decoder_input_ids=None,
+        decoder_attention_mask=None,
+        head_mask=None,
+        decoder_head_mask=None,
+        cross_attn_head_mask=None,
+        encoder_outputs: Optional[Union[Tuple, TFBaseModelOutput]] = None,
+        past_key_values=None,
+        inputs_embeds=None,
+        decoder_inputs_embeds=None,
+        use_cache=None,
+        output_attentions=None,
+        output_hidden_states=None,
+        return_dict=None,
+        training=False,
+        **kwargs
+    ):
+        inputs = input_processing(
+            func=self.call,
+            config=self.config,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            decoder_input_ids=decoder_input_ids,
+            decoder_attention_mask=decoder_attention_mask,
+            head_mask=head_mask,
+            decoder_head_mask=decoder_head_mask,
+            cross_attn_head_mask=cross_attn_head_mask,
+            encoder_outputs=encoder_outputs,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            decoder_inputs_embeds=decoder_inputs_embeds,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+            training=training,
+            kwargs_call=kwargs,
+        )
+
+        outputs = self.model(
+            input_ids=inputs["input_ids"],
+            attention_mask=inputs["attention_mask"],
+            decoder_input_ids=inputs["decoder_input_ids"],
+            decoder_attention_mask=inputs["decoder_attention_mask"],
+            head_mask=inputs["head_mask"],
+            decoder_head_mask=inputs["decoder_head_mask"],
+            cross_attn_head_mask=inputs["cross_attn_head_mask"],
+            encoder_outputs=inputs["encoder_outputs"],
+            past_key_values=inputs["past_key_values"],
+            inputs_embeds=inputs["inputs_embeds"],
+            decoder_inputs_embeds=inputs["decoder_inputs_embeds"],
+            use_cache=inputs["use_cache"],
+            output_attentions=inputs["output_attentions"],
+            output_hidden_states=inputs["output_hidden_states"],
+            return_dict=inputs["return_dict"],
+            training=inputs["training"],
+        )
+
+        return outputs
+
+    # Copied from transformers.models.bart.modeling_tf_bart.TFBartModel.serving_output
+    def serving_output(self, output):
+        pkv = tf.tuple(output.past_key_values)[1] if self.config.use_cache else None
+        dec_hs = tf.convert_to_tensor(output.decoder_hidden_states) if self.config.output_hidden_states else None
+        dec_attns = tf.convert_to_tensor(output.decoder_attentions) if self.config.output_attentions else None
+        cross_attns = tf.convert_to_tensor(output.cross_attentions) if self.config.output_attentions else None
+        enc_hs = tf.convert_to_tensor(output.encoder_hidden_states) if self.config.output_hidden_states else None
+        enc_attns = tf.convert_to_tensor(output.encoder_attentions) if self.config.output_attentions else None
+
+        return TFSeq2SeqModelOutput(
+            last_hidden_state=output.last_hidden_state,
+            past_key_values=pkv,
+            decoder_hidden_states=dec_hs,
+            decoder_attentions=dec_attns,
+            cross_attentions=cross_attns,
+            encoder_last_hidden_state=output.encoder_last_hidden_state,
+            encoder_hidden_states=enc_hs,
+            encoder_attentions=enc_attns,
+        )
 
 
 @add_start_docstrings(
@@ -2379,7 +2713,8 @@ class TF{{cookiecutter.camelcase_modelname}}ForConditionalGeneration(TF{{cookiec
 
     def __init__(self, config, *inputs, **kwargs):
         super().__init__(config, *inputs, **kwargs)
-        self.model = TF{{cookiecutter.camelcase_modelname}}Model(config, name="model")
+        self.model = TF{{cookiecutter.camelcase_modelname}}MainLayer(config, name="model")
+        self.model._set_save_spec(inputs=self.serving.input_signature)
         self.use_cache = config.use_cache
         # final_bias_logits is registered as a buffer in pytorch, so not trainable for the the sake of consistency.
         self.final_logits_bias = self.add_weight(
@@ -2389,22 +2724,20 @@ class TF{{cookiecutter.camelcase_modelname}}ForConditionalGeneration(TF{{cookiec
     def get_decoder(self):
         return self.model.decoder
 
-    def resize_token_embeddings(self, new_num_tokens):
-        super().resize_token_embeddings(new_num_tokens=new_num_tokens)
+    def get_encoder(self):
+        return self.model.encoder
 
-        # {{cookiecutter.uppercase_modelname}} is a special case where the bias has two dimensions
-        # and not named just `bias`
-        if new_num_tokens is not None:
-            num_tokens_to_copy = min(shape_list(self.final_logits_bias)[0], new_num_tokens)
-            init_bias = tf.zeros((new_num_tokens,))
-            init_bias[:num_tokens_to_copy] = self.final_logits_bias.value()[:num_tokens_to_copy]
-            self.final_logits_bias = self.add_weight(
-                shape=(1, new_num_tokens),
-                initializer="zeros",
-                trainable=False,
-                name="final_logits_bias",
-            )
-            self.final_logits_bias.assign(init_bias)
+    def get_bias(self):
+        return {"final_logits_bias": self.final_logits_bias}
+
+    def set_bias(self, value):
+        self.final_logits_bias = value["final_logits_bias"]
+
+    def get_output_embeddings(self):
+        return self.get_input_embeddings()
+
+    def set_output_embeddings(self, value):
+        self.set_input_embeddings(value)
 
     @add_start_docstrings_to_model_forward({{cookiecutter.uppercase_modelname}}_INPUTS_DOCSTRING)
     @replace_return_docstrings(output_type=TFSeq2SeqLMOutput, config_class=_CONFIG_FOR_DOC)
@@ -2414,6 +2747,9 @@ class TF{{cookiecutter.camelcase_modelname}}ForConditionalGeneration(TF{{cookiec
         attention_mask=None,
         decoder_input_ids=None,
         decoder_attention_mask=None,
+        head_mask=None,
+        decoder_head_mask=None,
+        cross_attn_head_mask=None,
         encoder_outputs: Optional[TFBaseModelOutput] = None,
         past_key_values=None,
         inputs_embeds=None,
@@ -2449,6 +2785,9 @@ class TF{{cookiecutter.camelcase_modelname}}ForConditionalGeneration(TF{{cookiec
             attention_mask=attention_mask,
             decoder_input_ids=decoder_input_ids,
             decoder_attention_mask=decoder_attention_mask,
+            head_mask=head_mask,
+            decoder_head_mask=decoder_head_mask,
+            cross_attn_head_mask=cross_attn_head_mask,
             encoder_outputs=encoder_outputs,
             past_key_values=past_key_values,
             inputs_embeds=inputs_embeds,
@@ -2475,6 +2814,9 @@ class TF{{cookiecutter.camelcase_modelname}}ForConditionalGeneration(TF{{cookiec
             decoder_input_ids=inputs["decoder_input_ids"],
             encoder_outputs=inputs["encoder_outputs"],
             decoder_attention_mask=inputs["decoder_attention_mask"],
+            head_mask=inputs["head_mask"],
+            decoder_head_mask=inputs["decoder_head_mask"],
+            cross_attn_head_mask=inputs["cross_attn_head_mask"],
             past_key_values=inputs["past_key_values"],
             inputs_embeds=inputs["inputs_embeds"],
             decoder_inputs_embeds=inputs["decoder_inputs_embeds"],
@@ -2497,9 +2839,30 @@ class TF{{cookiecutter.camelcase_modelname}}ForConditionalGeneration(TF{{cookiec
             past_key_values=outputs.past_key_values,  # index 1 of d outputs
             decoder_hidden_states=outputs.decoder_hidden_states,  # index 2 of d outputs
             decoder_attentions=outputs.decoder_attentions,  # index 3 of d outputs
-            encoder_last_hidden_state=outputs.last_hidden_state,  # index 0 of encoder outputs
+            cross_attentions=outputs.cross_attentions,  # index 4 of d outputs
+            encoder_last_hidden_state=outputs.encoder_last_hidden_state,  # index 0 of encoder outputs
             encoder_hidden_states=outputs.encoder_hidden_states,  # 1 of e out
             encoder_attentions=outputs.encoder_attentions,  # 2 of e out
+        )
+
+    # Copied from transformers.models.bart.modeling_tf_bart.TFBartForConditionalGeneration.serving_output
+    def serving_output(self, output):
+        pkv = tf.tuple(output.past_key_values)[1] if self.config.use_cache else None
+        dec_hs = tf.convert_to_tensor(output.decoder_hidden_states) if self.config.output_hidden_states else None
+        dec_attns = tf.convert_to_tensor(output.decoder_attentions) if self.config.output_attentions else None
+        cross_attns = tf.convert_to_tensor(output.cross_attentions) if self.config.output_attentions else None
+        enc_hs = tf.convert_to_tensor(output.encoder_hidden_states) if self.config.output_hidden_states else None
+        enc_attns = tf.convert_to_tensor(output.encoder_attentions) if self.config.output_attentions else None
+
+        return TFSeq2SeqLMOutput(
+            logits=output.logits,
+            past_key_values=pkv,
+            decoder_hidden_states=dec_hs,
+            decoder_attentions=dec_attns,
+            cross_attentions=cross_attns,
+            encoder_last_hidden_state=output.encoder_last_hidden_state,
+            encoder_hidden_states=enc_hs,
+            encoder_attentions=enc_attns,
         )
 
     def prepare_inputs_for_generation(self, decoder_input_ids, past, attention_mask, use_cache, **kwargs) -> Dict:
@@ -2547,15 +2910,9 @@ class TF{{cookiecutter.camelcase_modelname}}ForConditionalGeneration(TF{{cookiec
         reordered_past = ()
         for layer_past_key_values in past_key_values:
             reordered_past += (
-                tuple(tf.gather(layer_past_key_value, beam_idx) for layer_past_key_value in layer_past_key_values),
+                tuple(tf.gather(layer_past_key_value, beam_idx) for layer_past_key_value in layer_past_key_values[:2]) + layer_past_key_values[2:],
             )
         return (past[0], reordered_past)
-
-    def get_output_embeddings(self):
-        return self.model.shared
-
-    def get_encoder(self):
-        return self.model.encoder
 
     def compute_loss(self, labels, logits):
         """CrossEntropyLoss that ignores pad tokens"""

@@ -77,10 +77,21 @@ ENCODER_DECODER_INPUTS_DOCSTRING = r"""
 
             `What are attention masks? <../glossary.html#attention-mask>`__
         decoder_input_ids (:obj:`torch.LongTensor` of shape :obj:`(batch_size, target_sequence_length)`, `optional`):
+            Indices of decoder input sequence tokens in the vocabulary.
+
+            Indices can be obtained using :class:`~transformers.PreTrainedTokenizer`. See
+            :meth:`transformers.PreTrainedTokenizer.encode` and :meth:`transformers.PreTrainedTokenizer.__call__` for
+            details.
+
+            `What are input IDs? <../glossary.html#input-ids>`__
+
+            If :obj:`past_key_values` is used, optionally only the last :obj:`decoder_input_ids` have to be input (see
+            :obj:`past_key_values`).
+
             Provide for sequence to sequence training to the decoder. Indices can be obtained using
-            :class:`~transformers.PretrainedTokenizer`. See :meth:`transformers.PreTrainedTokenizer.encode` and
+            :class:`~transformers.PreTrainedTokenizer`. See :meth:`transformers.PreTrainedTokenizer.encode` and
             :meth:`transformers.PreTrainedTokenizer.__call__` for details.
-        decoder_attention_mask (:obj:`torch.BoolTensor` of shape :obj:`(batch_size, tgt_seq_len)`, `optional`):
+        decoder_attention_mask (:obj:`torch.BoolTensor` of shape :obj:`(batch_size, target_sequence_length)`, `optional`):
             Default behavior: generate a tensor that ignores pad tokens in :obj:`decoder_input_ids`. Causal mask will
             also be used by default.
         encoder_outputs (:obj:`tuple(torch.FloatTensor)`, `optional`):
@@ -148,9 +159,7 @@ class EncoderDecoderModel(PreTrainedModel):
         if config is None:
             config = EncoderDecoderConfig.from_encoder_decoder_configs(encoder.config, decoder.config)
         else:
-            assert isinstance(config, self.config_class), "config: {} has to be of type {}".format(
-                config, self.config_class
-            )
+            assert isinstance(config, self.config_class), f"config: {config} has to be of type {self.config_class}"
         # initialize with config
         super().__init__(config)
 
@@ -166,6 +175,21 @@ class EncoderDecoderModel(PreTrainedModel):
 
         self.encoder = encoder
         self.decoder = decoder
+
+        if self.encoder.config.to_dict() != self.config.encoder.to_dict():
+            logger.warning(
+                f"Config of the encoder: {self.encoder.__class__} is overwritten by shared encoder config: {self.config.encoder}"
+            )
+        if self.decoder.config.to_dict() != self.config.decoder.to_dict():
+            logger.warning(
+                f"Config of the decoder: {self.decoder.__class__} is overwritten by shared decoder config: {self.config.decoder}"
+            )
+
+        # make sure that the individual model's config refers to the shared config
+        # so that the updates to the config will be synced
+        self.encoder.config = self.config.encoder
+        self.decoder.config = self.config.decoder
+
         assert (
             self.encoder.get_output_embeddings() is None
         ), "The encoder {} should not have a LM Head. Please use a model without LM Head"
@@ -196,6 +220,13 @@ class EncoderDecoderModel(PreTrainedModel):
 
     def set_output_embeddings(self, new_embeddings):
         return self.decoder.set_output_embeddings(new_embeddings)
+
+    @classmethod
+    def from_pretrained(cls, *args, **kwargs):
+        # At the moment fast initialization is not supported
+        # for composite models
+        kwargs["_fast_init"] = False
+        return super().from_pretrained(*args, **kwargs)
 
     @classmethod
     def from_encoder_decoder_pretrained(
@@ -444,10 +475,16 @@ class EncoderDecoderModel(PreTrainedModel):
             "decoder_attention_mask": decoder_attention_mask,
             "decoder_input_ids": decoder_inputs["input_ids"],
             "encoder_outputs": encoder_outputs,
-            "past_key_values": past,
+            "past_key_values": decoder_inputs["past_key_values"],
             "use_cache": use_cache,
         }
         return input_dict
+
+    def resize_token_embeddings(self, *args, **kwargs):
+        raise NotImplementedError(
+            "Resizing the embedding layers via the EncoderDecoderModel directly is not supported."
+            "Please use the respective methods of the wrapped objects (model.encoder.resize_token_embeddings(...) or model.decoder.resize_token_embeddings(...))"
+        )
 
     def _reorder_cache(self, past, beam_idx):
         # apply decoder cache reordering here

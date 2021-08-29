@@ -16,4 +16,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .tokenization_bertweet import BertweetTokenizer
+from typing import TYPE_CHECKING
+
+from ...file_utils import _LazyModule
+
+
+_import_structure = {
+    "tokenization_bertweet": ["BertweetTokenizer"],
+}
+
+
+if TYPE_CHECKING:
+    from .tokenization_bertweet import BertweetTokenizer
+
+else:
+    import sys
+
+    sys.modules[__name__] = _LazyModule(__name__, globals()["__file__"], _import_structure)

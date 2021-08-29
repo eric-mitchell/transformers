@@ -16,35 +16,92 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from ...file_utils import is_sentencepiece_available, is_tf_available, is_tokenizers_available, is_torch_available
-from .configuration_xlm_roberta import XLM_ROBERTA_PRETRAINED_CONFIG_ARCHIVE_MAP, XLMRobertaConfig
+from typing import TYPE_CHECKING
 
+from ...file_utils import (
+    _LazyModule,
+    is_sentencepiece_available,
+    is_tf_available,
+    is_tokenizers_available,
+    is_torch_available,
+)
+
+
+_import_structure = {
+    "configuration_xlm_roberta": [
+        "XLM_ROBERTA_PRETRAINED_CONFIG_ARCHIVE_MAP",
+        "XLMRobertaConfig",
+        "XLMRobertaOnnxConfig",
+    ],
+}
 
 if is_sentencepiece_available():
-    from .tokenization_xlm_roberta import XLMRobertaTokenizer
+    _import_structure["tokenization_xlm_roberta"] = ["XLMRobertaTokenizer"]
 
 if is_tokenizers_available():
-    from .tokenization_xlm_roberta_fast import XLMRobertaTokenizerFast
+    _import_structure["tokenization_xlm_roberta_fast"] = ["XLMRobertaTokenizerFast"]
 
 if is_torch_available():
-    from .modeling_xlm_roberta import (
-        XLM_ROBERTA_PRETRAINED_MODEL_ARCHIVE_LIST,
-        XLMRobertaForCausalLM,
-        XLMRobertaForMaskedLM,
-        XLMRobertaForMultipleChoice,
-        XLMRobertaForQuestionAnswering,
-        XLMRobertaForSequenceClassification,
-        XLMRobertaForTokenClassification,
-        XLMRobertaModel,
-    )
+    _import_structure["modeling_xlm_roberta"] = [
+        "XLM_ROBERTA_PRETRAINED_MODEL_ARCHIVE_LIST",
+        "XLMRobertaForCausalLM",
+        "XLMRobertaForMaskedLM",
+        "XLMRobertaForMultipleChoice",
+        "XLMRobertaForQuestionAnswering",
+        "XLMRobertaForSequenceClassification",
+        "XLMRobertaForTokenClassification",
+        "XLMRobertaModel",
+    ]
 
 if is_tf_available():
-    from .modeling_tf_xlm_roberta import (
-        TF_XLM_ROBERTA_PRETRAINED_MODEL_ARCHIVE_LIST,
-        TFXLMRobertaForMaskedLM,
-        TFXLMRobertaForMultipleChoice,
-        TFXLMRobertaForQuestionAnswering,
-        TFXLMRobertaForSequenceClassification,
-        TFXLMRobertaForTokenClassification,
-        TFXLMRobertaModel,
+    _import_structure["modeling_tf_xlm_roberta"] = [
+        "TF_XLM_ROBERTA_PRETRAINED_MODEL_ARCHIVE_LIST",
+        "TFXLMRobertaForMaskedLM",
+        "TFXLMRobertaForMultipleChoice",
+        "TFXLMRobertaForQuestionAnswering",
+        "TFXLMRobertaForSequenceClassification",
+        "TFXLMRobertaForTokenClassification",
+        "TFXLMRobertaModel",
+    ]
+
+
+if TYPE_CHECKING:
+    from .configuration_xlm_roberta import (
+        XLM_ROBERTA_PRETRAINED_CONFIG_ARCHIVE_MAP,
+        XLMRobertaConfig,
+        XLMRobertaOnnxConfig,
     )
+
+    if is_sentencepiece_available():
+        from .tokenization_xlm_roberta import XLMRobertaTokenizer
+
+    if is_tokenizers_available():
+        from .tokenization_xlm_roberta_fast import XLMRobertaTokenizerFast
+
+    if is_torch_available():
+        from .modeling_xlm_roberta import (
+            XLM_ROBERTA_PRETRAINED_MODEL_ARCHIVE_LIST,
+            XLMRobertaForCausalLM,
+            XLMRobertaForMaskedLM,
+            XLMRobertaForMultipleChoice,
+            XLMRobertaForQuestionAnswering,
+            XLMRobertaForSequenceClassification,
+            XLMRobertaForTokenClassification,
+            XLMRobertaModel,
+        )
+
+    if is_tf_available():
+        from .modeling_tf_xlm_roberta import (
+            TF_XLM_ROBERTA_PRETRAINED_MODEL_ARCHIVE_LIST,
+            TFXLMRobertaForMaskedLM,
+            TFXLMRobertaForMultipleChoice,
+            TFXLMRobertaForQuestionAnswering,
+            TFXLMRobertaForSequenceClassification,
+            TFXLMRobertaForTokenClassification,
+            TFXLMRobertaModel,
+        )
+
+else:
+    import sys
+
+    sys.modules[__name__] = _LazyModule(__name__, globals()["__file__"], _import_structure)

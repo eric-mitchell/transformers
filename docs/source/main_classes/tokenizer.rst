@@ -53,15 +53,20 @@ PreTrainedTokenizer
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 .. autoclass:: transformers.PreTrainedTokenizer
-    :special-members: __call__
-    :members:
+    :special-members: __call__, batch_decode, decode, encode, push_to_hub
+    :members: 
 
 
 PreTrainedTokenizerFast
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
+The :class:`~transformers.PreTrainedTokenizerFast` depend on the `tokenizers
+<https://huggingface.co/docs/tokenizers>`__ library. The tokenizers obtained from the 🤗 tokenizers library can be
+loaded very simply into 🤗 transformers. Take a look at the :doc:`Using tokenizers from 🤗 tokenizers
+<../fast_tokenizers>` page to understand how this is done.
+
 .. autoclass:: transformers.PreTrainedTokenizerFast
-    :special-members: __call__
+    :special-members: __call__, batch_decode, decode, encode, push_to_hub
     :members:
 
 

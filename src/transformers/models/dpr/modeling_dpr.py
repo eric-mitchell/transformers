@@ -37,6 +37,7 @@ from .configuration_dpr import DPRConfig
 logger = logging.get_logger(__name__)
 
 _CONFIG_FOR_DOC = "DPRConfig"
+_CHECKPOINT_FOR_DOC = "facebook/dpr-ctx_encoder-single-nq-base"
 
 DPR_CONTEXT_ENCODER_PRETRAINED_MODEL_ARCHIVE_LIST = [
     "facebook/dpr-ctx_encoder-single-nq-base",
@@ -241,8 +242,8 @@ class DPRSpanPredictor(PreTrainedModel):
         # compute logits
         logits = self.qa_outputs(sequence_output)
         start_logits, end_logits = logits.split(1, dim=-1)
-        start_logits = start_logits.squeeze(-1)
-        end_logits = end_logits.squeeze(-1)
+        start_logits = start_logits.squeeze(-1).contiguous()
+        end_logits = end_logits.squeeze(-1).contiguous()
         relevance_logits = self.qa_classifier(sequence_output[:, 0, :])
 
         # resize
@@ -364,28 +365,35 @@ DPR_ENCODERS_INPUTS_DOCSTRING = r"""
 
             Indices can be obtained using :class:`~transformers.DPRTokenizer`. See
             :meth:`transformers.PreTrainedTokenizer.encode` and :meth:`transformers.PreTrainedTokenizer.__call__` for
-            details. attention_mask (:obj:`torch.FloatTensor` of shape :obj:`(batch_size, sequence_length)`,
-            `optional`): Mask to avoid performing attention on padding token indices. Mask values selected in ``[0,
-            1]``:
+            details.
+
+            `What are input IDs? <../glossary.html#input-ids>`__
+        attention_mask (:obj:`torch.FloatTensor` of shape :obj:`(batch_size, sequence_length)`, `optional`):
+            Mask to avoid performing attention on padding token indices. Mask values selected in ``[0, 1]``:
 
             - 1 for tokens that are **not masked**,
             - 0 for tokens that are **masked**.
 
-            `What are attention masks? <../glossary.html#attention-mask>`__ token_type_ids (:obj:`torch.LongTensor` of
-            shape :obj:`(batch_size, sequence_length)`, `optional`): Segment token indices to indicate first and second
-            portions of the inputs. Indices are selected in ``[0, 1]``:
+            `What are attention masks? <../glossary.html#attention-mask>`__
+        token_type_ids (:obj:`torch.LongTensor` of shape :obj:`(batch_size, sequence_length)`, `optional`):
+            Segment token indices to indicate first and second portions of the inputs. Indices are selected in ``[0,
+            1]``:
 
             - 0 corresponds to a `sentence A` token,
             - 1 corresponds to a `sentence B` token.
 
-            `What are token type IDs? <../glossary.html#token-type-ids>`_ inputs_embeds (:obj:`torch.FloatTensor` of
-            shape :obj:`(batch_size, sequence_length, hidden_size)`, `optional`): Optionally, instead of passing
-            :obj:`input_ids` you can choose to directly pass an embedded representation. This is useful if you want
-            more control over how to convert :obj:`input_ids` indices into associated vectors than the model's internal
-            embedding lookup matrix. output_attentions (:obj:`bool`, `optional`): Whether or not to return the
-            attentions tensors of all attention layers. See ``attentions`` under returned tensors for more detail.
-            output_hidden_states (:obj:`bool`, `optional`): Whether or not to return the hidden states of all layers.
-            See ``hidden_states`` under returned tensors for more detail. return_dict (:obj:`bool`, `optional`):
+            `What are token type IDs? <../glossary.html#token-type-ids>`_
+        inputs_embeds (:obj:`torch.FloatTensor` of shape :obj:`(batch_size, sequence_length, hidden_size)`, `optional`):
+            Optionally, instead of passing :obj:`input_ids` you can choose to directly pass an embedded representation.
+            This is useful if you want more control over how to convert :obj:`input_ids` indices into associated
+            vectors than the model's internal embedding lookup matrix.
+        output_attentions (:obj:`bool`, `optional`):
+            Whether or not to return the attentions tensors of all attention layers. See ``attentions`` under returned
+            tensors for more detail.
+        output_hidden_states (:obj:`bool`, `optional`):
+            Whether or not to return the hidden states of all layers. See ``hidden_states`` under returned tensors for
+            more detail.
+        return_dict (:obj:`bool`, `optional`):
             Whether or not to return a :class:`~transformers.file_utils.ModelOutput` instead of a plain tuple.
 """
 
@@ -403,6 +411,8 @@ DPR_READER_INPUTS_DOCSTRING = r"""
 
             Indices can be obtained using :class:`~transformers.DPRReaderTokenizer`. See this class documentation for
             more details.
+
+            `What are input IDs? <../glossary.html#input-ids>`__
         attention_mask (:obj:`torch.FloatTensor` of shape :obj:`(n_passages, sequence_length)`, `optional`):
             Mask to avoid performing attention on padding token indices. Mask values selected in ``[0, 1]``:
 
@@ -617,7 +627,7 @@ class DPRReader(DPRPretrainedReader):
             ...         return_tensors='pt'
             ...     )
             >>> outputs = model(**encoded_inputs)
-            >>> start_logits = outputs.stat_logits
+            >>> start_logits = outputs.start_logits
             >>> end_logits = outputs.end_logits
             >>> relevance_logits = outputs.relevance_logits
 

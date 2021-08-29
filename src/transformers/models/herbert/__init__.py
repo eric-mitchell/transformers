@@ -16,9 +16,26 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from ...file_utils import is_tokenizers_available
-from .tokenization_herbert import HerbertTokenizer
+from typing import TYPE_CHECKING
 
+from ...file_utils import _LazyModule, is_tokenizers_available
+
+
+_import_structure = {
+    "tokenization_herbert": ["HerbertTokenizer"],
+}
 
 if is_tokenizers_available():
-    from .tokenization_herbert_fast import HerbertTokenizerFast
+    _import_structure["tokenization_herbert_fast"] = ["HerbertTokenizerFast"]
+
+
+if TYPE_CHECKING:
+    from .tokenization_herbert import HerbertTokenizer
+
+    if is_tokenizers_available():
+        from .tokenization_herbert_fast import HerbertTokenizerFast
+
+else:
+    import sys
+
+    sys.modules[__name__] = _LazyModule(__name__, globals()["__file__"], _import_structure)

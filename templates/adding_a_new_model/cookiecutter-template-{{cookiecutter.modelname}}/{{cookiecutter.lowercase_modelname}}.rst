@@ -10,7 +10,7 @@
     an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License for the
     specific language governing permissions and limitations under the License.
 
-{{cookiecutter.uppercase_modelname}}
+{{cookiecutter.modelname}}
 -----------------------------------------------------------------------------------------------------------------------
 
 Overview
@@ -26,6 +26,10 @@ The abstract from the paper is the following:
 Tips:
 
 <INSERT TIPS ABOUT MODEL HERE>
+
+This model was contributed by `<INSERT YOUR HF USERNAME HERE> 
+<https://huggingface.co/<INSERT YOUR HF USERNAME HERE>>`__. The original code can be found `here 
+<<INSERT LINK TO GITHUB REPO HERE>>`__.
 
 {{cookiecutter.camelcase_modelname}}Config
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -46,8 +50,7 @@ Tips:
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 .. autoclass:: transformers.{{cookiecutter.camelcase_modelname}}TokenizerFast
-    :members: build_inputs_with_special_tokens, get_special_tokens_mask,
-        create_token_type_ids_from_sequences, save_vocabulary
+    :members:
 
 
 {% if "PyTorch" in cookiecutter.generate_tensorflow_and_pytorch -%}
@@ -121,6 +124,13 @@ Tips:
     :members: forward
 
 
+{{cookiecutter.camelcase_modelname}}ForCausalLM
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. autoclass:: transformers.{{cookiecutter.camelcase_modelname}}ForCausalLM
+    :members: forward
+
+
 {% endif -%}
 {% endif -%}
 {% if "TensorFlow" in cookiecutter.generate_tensorflow_and_pytorch -%}
@@ -180,5 +190,7 @@ TF{{cookiecutter.camelcase_modelname}}ForConditionalGeneration
 
 .. autoclass:: transformers.TF{{cookiecutter.camelcase_modelname}}ForConditionalGeneration
     :members: call
+
+
 {% endif -%}
 {% endif -%}
