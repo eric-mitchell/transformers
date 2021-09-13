@@ -944,7 +944,12 @@ class T5Stack(T5PreTrainedModel):
 
         hidden_states = self.dropout(inputs_embeds)
 
+        grad_was_enabled = torch.is_grad_enabled()
+        no_grad_layers = self.no_grad_layers if hasattr(self, "no_grad_layers") else 0
+
         for i, (layer_module, past_key_value) in enumerate(zip(self.block, past_key_values)):
+            torch.set_grad_enabled(i >= no_grad_layers)
+
             layer_head_mask = head_mask[i]
             cross_attn_layer_head_mask = cross_attn_head_mask[i]
             # Model parallel
@@ -1037,6 +1042,7 @@ class T5Stack(T5PreTrainedModel):
                     if i == v[-1] and "cuda:" + str(k) != self.last_device:
                         hidden_states = hidden_states.to("cuda:" + str(k + 1))
 
+        torch.set_grad_enabled(grad_was_enabled)
         hidden_states = self.final_layer_norm(hidden_states)
         hidden_states = self.dropout(hidden_states)
 
