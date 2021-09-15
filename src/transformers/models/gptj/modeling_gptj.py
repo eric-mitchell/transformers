@@ -582,7 +582,10 @@ class GPTJModel(GPTJPreTrainedModel):
         presents = () if use_cache else None
         all_self_attentions = () if output_attentions else None
         all_hidden_states = () if output_hidden_states else None
+        grad_was_enabled = torch.is_grad_enabled()
+        no_grad_layers = self.no_grad_layers if hasattr(self, "no_grad_layers") else 0
         for i, (block, layer_past) in enumerate(zip(self.h, past_key_values)):
+            torch.set_grad_enabled(i >= no_grad_layers)
 
             # Model parallel
             if self.model_parallel:
@@ -644,6 +647,7 @@ class GPTJModel(GPTJPreTrainedModel):
                     if i == v[-1] and "cuda:" + str(k) != self.last_device:
                         hidden_states = hidden_states.to("cuda:" + str(k + 1))
 
+        torch.set_grad_enabled(grad_was_enabled)
         hidden_states = self.ln_f(hidden_states)
 
         hidden_states = hidden_states.view(*output_shape)
